@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+# -*- encoding: utf-8 -*-
+
 import argparse
 
 import sys
@@ -21,6 +24,8 @@ import cv2
 import re
 
 import numpy as np
+
+import mraa
 
 import RPi.GPIO as GPIO
 
@@ -54,11 +59,14 @@ import spidev  # Added for MCP3002 ADC
 
 
 
+
+
 # Suppress KMP duplicate lib warnings
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-
+# Define project root (change this to your project directory)
+PROJECT_ROOT = "~/Smart_eye_firmware"
 
 # Initialize pygame mixer
 
@@ -168,98 +176,57 @@ BATTERY_5_PERCENT = 7.26   # 5% threshold (7.2 + 0.06)
 
 
 
+
 # Piper TTS Configuration
+PIPER_BINARY_PATH = os.path.join(PROJECT_ROOT, "piper/piper/piper")
 
-PIPER_BINARY_PATH = "/home/abhimanyu/piper/piper/piper"
-
-PIPER_MODEL_EN = "/home/abhimanyu/piper/en_US-amy-medium.onnx"
-
-PIPER_MODEL_HI = "/home/abhimanyu/piper/hi_IN-pratham-medium.onnx"  # Hindi model
+PIPER_MODEL_EN = os.path.join(PROJECT_ROOT, "piper/en_US-amy-medium.onnx")
+PIPER_MODEL_HI = os.path.join(PROJECT_ROOT, "piper/hi_IN-pratham-medium.onnx")  # Hindi model
 
 PIPER_OUTPUT_RATE = 22050
 
 
 
 # Audio files for detections - separated by language
-
 AUDIO_FILES = {
-
     "en": {
-
-        "device_on": "/home/abhimanyu/wav/English/device_turned_on.wav",
-
-        "pothole": "/home/abhimanyu/wav/English/pothole.wav",
-
-        "stairs": "/home/abhimanyu/wav/English/stairs.wav",
-
-        "fifty rupees": "/home/abhimanyu/wav/English/fifty_rupees.wav",
-
-        "five hundred rupees": "/home/abhimanyu/wav/English/five_hundred_rupees.wav",
-
-        "five rupees": "/home/abhimanyu/wav/English/five_rupees.wav",
-
-        "hundred rupees": "/home/abhimanyu/wav/English/hundred_rupees.wav",
-
-        "one rupees": "/home/abhimanyu/wav/English/one_rupees.wav",
-
-        "ten rupees": "/home/abhimanyu/wav/English/ten_rupees.wav",
-
-        "twenty rupees": "/home/abhimanyu/wav/English/twenty_rupees.wav",
-
-        "two hundred rupees": "/home/abhimanyu/wav/English/two_hundred_rupees.wav",
-
-        "two rupees": "/home/abhimanyu/wav/English/two_rupees.wav",
-
-        "two thousand rupees": "/home/abhimanyu/wav/English/two_thousand_rupees.wav",
-
-        "no_text_detected": "/home/abhimanyu/wav/English/no_text_detected.wav",
-
-        "battery_10": "/home/abhimanyu/wav/English/battery_10.wav",
-
-        "battery_shutdown": "/home/abhimanyu/wav/English/battery_shutdown.wav",
-
-        "eng_toggle": "/home/abhimanyu/wav/English/English_mode.wav",
-
+        "device_on": os.path.join(PROJECT_ROOT, "wav/English/device_turned_on.wav"),
+        "pothole": os.path.join(PROJECT_ROOT, "wav/English/pothole.wav"),
+        "stairs": os.path.join(PROJECT_ROOT, "wav/English/stairs.wav"),
+        "fifty rupees": os.path.join(PROJECT_ROOT, "wav/English/fifty_rupees.wav"),
+        "five hundred rupees": os.path.join(PROJECT_ROOT, "wav/English/five_hundred_rupees.wav"),
+        "five rupees": os.path.join(PROJECT_ROOT, "wav/English/five_rupees.wav"),
+        "hundred rupees": os.path.join(PROJECT_ROOT, "wav/English/hundred_rupees.wav"),
+        "one rupees": os.path.join(PROJECT_ROOT, "wav/English/one_rupees.wav"),
+        "ten rupees": os.path.join(PROJECT_ROOT, "wav/English/ten_rupees.wav"),
+        "twenty rupees": os.path.join(PROJECT_ROOT, "wav/English/twenty_rupees.wav"),
+        "two hundred rupees": os.path.join(PROJECT_ROOT, "wav/English/two_hundred_rupees.wav"),
+        "two rupees": os.path.join(PROJECT_ROOT, "wav/English/two_rupees.wav"),
+        "two thousand rupees": os.path.join(PROJECT_ROOT, "wav/English/two_thousand_rupees.wav"),
+        "no_text_detected": os.path.join(PROJECT_ROOT, "wav/English/no_text_detected.wav"),
+        "battery_10": os.path.join(PROJECT_ROOT, "wav/English/battery_10.wav"),
+        "battery_shutdown": os.path.join(PROJECT_ROOT, "wav/English/battery_shutdown.wav"),
+        "eng_toggle": os.path.join(PROJECT_ROOT, "wav/English/English_mode.wav"),
     },
-
     "hi": {
-
-        "device_on": "/home/abhimanyu/wav/Hindi/turned_on.wav",
-
-        "pothole": "/home/abhimanyu/wav/Hindi/pothole_hindi.wav",
-
-        "stairs": "/home/abhimanyu/wav/Hindi/stairs_detected.wav",
-
-        "fifty rupees": "/home/abhimanyu/wav/Hindi/fifty_rupees.wav",
-
-        "five hundred rupees": "/home/abhimanyu/wav/Hindi/five_hundred_rupees.wav",
-
-        "five rupees": "/home/abhimanyu/wav/Hindi/five_rupees.wav",
-
-        "hundred rupees": "/home/abhimanyu/wav/Hindi/hundred_rupees.wav",
-
-        "one rupees": "/home/abhimanyu/wav/Hindi/one_rupees.wav",
-
-        "ten rupees": "/home/abhimanyu/wav/Hindi/ten_rupees.wav",
-
-        "twenty rupees": "/home/abhimanyu/wav/Hindi/twenty_rupees.wav",
-
-        "two hundred rupees": "/home/abhimanyu/wav/Hindi/two_hundred_rupees.wav",
-
-        "two rupees": "/home/abhimanyu/wav/Hindi/two_rupees.wav",
-
-        "two thousand rupees": "/home/abhimanyu/wav/Hindi/two_thousand_rupees.wav",
-
-        "no_text_detected": "/home/abhimanyu/wav/Hindi/no_text_found.wav",
-
-        "battery_10": "/home/abhimanyu/wav/Hindi/ten_percent_battery_alert.wav",
-
-        "battery_shutdown": "/home/abhimanyu/wav/Hindi/five_percent_battery_alert.wav",
-
-        "hindi_toggle": "/home/abhimanyu/wav/Hindi/Hindi_mode.wav"
-
+        "device_on": os.path.join(PROJECT_ROOT, "wav/Hindi/turned_on.wav"),
+        "pothole": os.path.join(PROJECT_ROOT, "wav/Hindi/pothole_hindi.wav"),
+        "stairs": os.path.join(PROJECT_ROOT, "wav/Hindi/stairs_detected.wav"),
+        "fifty rupees": os.path.join(PROJECT_ROOT, "wav/Hindi/fifty_rupees.wav"),
+        "five hundred rupees": os.path.join(PROJECT_ROOT, "wav/Hindi/five_hundred_rupees.wav"),
+        "five rupees": os.path.join(PROJECT_ROOT, "wav/Hindi/five_rupees.wav"),
+        "hundred rupees": os.path.join(PROJECT_ROOT, "wav/Hindi/hundred_rupees.wav"),
+        "one rupees": os.path.join(PROJECT_ROOT, "wav/Hindi/one_rupees.wav"),
+        "ten rupees": os.path.join(PROJECT_ROOT, "wav/Hindi/ten_rupees.wav"),
+        "twenty rupees": os.path.join(PROJECT_ROOT, "wav/Hindi/twenty_rupees.wav"),
+        "two hundred rupees": os.path.join(PROJECT_ROOT, "wav/Hindi/two_hundred_rupees.wav"),
+        "two rupees": os.path.join(PROJECT_ROOT, "wav/Hindi/two_rupees.wav"),
+        "two thousand rupees": os.path.join(PROJECT_ROOT, "wav/Hindi/two_thousand_rupees.wav"),
+        "no_text_detected": os.path.join(PROJECT_ROOT, "wav/Hindi/no_text_found.wav"),
+        "battery_10": os.path.join(PROJECT_ROOT, "wav/Hindi/ten_percent_battery_alert.wav"),
+        "battery_shutdown": os.path.join(PROJECT_ROOT, "wav/Hindi/five_percent_battery_alert.wav"),
+        "hindi_toggle": os.path.join(PROJECT_ROOT, "wav/Hindi/Hindi_mode.wav")
     }
-
 }
 
 
@@ -1290,9 +1257,7 @@ def parse_detections(metadata: dict):
 
     if intrinsics.postprocess == "nanodet":
 
-        boxes, scores, classes = \
-
-            postprocess_nanodet_detection(outputs=np_outputs[0], conf=threshold, iou_thres=iou,
+        boxes, scores, classes = postprocess_nanodet_detection(outputs=np_outputs[0], conf=threshold, iou_thres=iou,
 
                                           max_out_dets=max_detections)[0]
 
