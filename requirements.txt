@@ -48,6 +48,7 @@ simsimd==6.5.3
 six==1.17.0
 soupsieve==2.8
 spidev==3.5
+pyserial==3.5
 stanza==1.1.1
 stringzilla==4.4.0
 sympy==1.14.0
