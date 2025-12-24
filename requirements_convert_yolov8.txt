@@ -1,0 +1,20 @@
+# YOLO to RKNN Converter Requirements
+# Python 3.10+
+
+# Core RKNN Toolkit
+rknn-toolkit2==2.3.2
+
+# Deep Learning Framework (compatible versions required)
+torch==2.4.0
+torchvision==0.19.0
+
+# YOLO Model Support
+ultralytics>=8.0.0
+
+# ONNX Format Support
+onnx>=1.14.0
+onnxslim>=0.1.71
+
+# Additional utilities
+numpy<=1.26.4
+protobuf>=3.20.2

@@ -130,6 +130,91 @@ def box_process(position):
     return xyxy
 
 def post_process(input_data):
+    """
+    Post-process YOLOv8 model output.
+    
+    Handles both formats:
+    1. Single unified output: (1, 84, 8400) - standard YOLOv8 format
+    2. Multi-output format: 6 tensors (3 branches × 2) - alternative format
+    """
+    # Check if we have the single unified output format
+    if len(input_data) == 1:
+        output = input_data[0]
+        
+        # Handle different possible shapes
+        if output.shape[0] == 1:
+            # Remove batch dimension if present
+            output = output.squeeze(0)  # Now shape: (84, 8400) or similar
+        
+        # Transpose if needed to get (predictions, channels) format
+        if len(output.shape) == 2:
+            if output.shape[1] == 8400:  # (84, 8400) -> transpose to (8400, 84)
+                output = output.transpose(1, 0)
+        
+        # Now output should be (8400, 84) format
+        # Split into box coordinates and class probabilities
+        boxes = output[:, :4]  # First 4 values are box coordinates
+        classes_conf = output[:, 4:]  # Remaining 80 values are class scores
+        
+        # Create a confidence score (objectness * max_class_score)
+        objectness = classes_conf[:, 0] if classes_conf.shape[1] > 80 else np.ones(len(boxes))
+        class_scores = classes_conf[:, 1:81] if classes_conf.shape[1] > 80 else classes_conf[:, :80]
+        
+        # Filter by objectness threshold
+        mask = objectness >= OBJ_THRESH
+        boxes = boxes[mask]
+        class_scores = class_scores[mask]
+        objectness = objectness[mask]
+        
+        if len(boxes) == 0:
+            return None, None, None
+        
+        # Get class predictions and scores
+        class_ids = np.argmax(class_scores, axis=1)
+        class_max_scores = np.max(class_scores, axis=1)
+        scores = objectness * class_max_scores
+        
+        # Filter by class score threshold
+        mask = scores >= OBJ_THRESH
+        boxes = boxes[mask]
+        class_ids = class_ids[mask]
+        scores = scores[mask]
+        
+        if len(boxes) == 0:
+            return None, None, None
+        
+        # Convert from xywh to xyxy format
+        if boxes.shape[1] == 4:
+            boxes_xyxy = np.zeros_like(boxes)
+            boxes_xyxy[:, 0] = boxes[:, 0] - boxes[:, 2] / 2  # x1
+            boxes_xyxy[:, 1] = boxes[:, 1] - boxes[:, 3] / 2  # y1
+            boxes_xyxy[:, 2] = boxes[:, 0] + boxes[:, 2] / 2  # x2
+            boxes_xyxy[:, 3] = boxes[:, 1] + boxes[:, 3] / 2  # y2
+            boxes = boxes_xyxy
+        
+        # Apply NMS
+        nboxes, nclasses, nscores = [], [], []
+        for c in set(class_ids):
+            inds = np.where(class_ids == c)
+            b = boxes[inds]
+            s = scores[inds]
+            keep = nms_boxes(b, s)
+            
+            if len(keep) != 0:
+                nboxes.append(b[keep])
+                nclasses.append(np.full(len(keep), c))
+                nscores.append(s[keep])
+        
+        if not nclasses or not nscores:
+            return None, None, None
+        
+        boxes = np.concatenate(nboxes)
+        classes = np.concatenate(nclasses)
+        scores = np.concatenate(nscores)
+        
+        return boxes, classes, scores
+    
+    # Original multi-output format handling
     boxes, scores, classes_conf = [], [], []
     defualt_branch=3
     pair_per_branch = len(input_data)//defualt_branch
@@ -179,7 +264,7 @@ def post_process(input_data):
     return boxes, classes, scores
 
 
-def draw(image, boxes, scores, classes, verbose=False):
+def draw(image, boxes, scores, classes, verbose=False, class_labels=None):
     """
     Draw bounding boxes and labels on image
     
@@ -189,13 +274,24 @@ def draw(image, boxes, scores, classes, verbose=False):
         scores: Confidence scores
         classes: Class indices
         verbose: If True, print detection info to console
+        class_labels: Tuple of class names. If None, uses default CLASSES
     """
+    if class_labels is None:
+        class_labels = CLASSES
+    
     for box, score, cl in zip(boxes, scores, classes):
         top, left, right, bottom = [int(_b) for _b in box]
+        # Make sure class index is valid
+        cl_idx = int(cl)
+        if cl_idx < len(class_labels):
+            class_name = class_labels[cl_idx]
+        else:
+            class_name = f"Class {cl_idx}"
+        
         if verbose:
-            print("%s @ (%d %d %d %d) %.3f" % (CLASSES[cl], top, left, right, bottom, score))
+            print("%s @ (%d %d %d %d) %.3f" % (class_name, top, left, right, bottom, score))
         cv2.rectangle(image, (top, left), (right, bottom), (255, 0, 0), 2)
-        cv2.putText(image, '{0} {1:.2f}'.format(CLASSES[cl], score),
+        cv2.putText(image, '{0} {1:.2f}'.format(class_name, score),
                     (top, left - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
 def setup_model(model_path, target='rk3566', device_id=None):

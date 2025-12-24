@@ -44,9 +44,33 @@ from yolov8 import (
 from py_utils.coco_utils import COCO_test_helper
 
 
+def load_custom_classes(classes_file):
+    """
+    Load custom class labels from a file.
+    File format: one class name per line
+    
+    Args:
+        classes_file: Path to classes file
+    
+    Returns:
+        Tuple of class names, or None if file doesn't exist
+    """
+    if not classes_file or not os.path.exists(classes_file):
+        return None
+    
+    try:
+        with open(classes_file, 'r') as f:
+            classes = tuple(line.strip() for line in f.readlines() if line.strip())
+        print(f"Loaded {len(classes)} custom classes from {classes_file}")
+        return classes
+    except Exception as e:
+        print(f"Error loading classes file: {e}")
+        return None
+
+
 class LiveVideoDetector:
     def __init__(self, model_path, device_path="/dev/video11", target='rk3588', 
-                 device_id=None, fps=30, headless=False, confidence_threshold=0.25):
+                 device_id=None, fps=30, headless=False, confidence_threshold=0.25, custom_classes=None):
         """
         Initialize Live Video Detector with optimizations for high FPS
         
@@ -58,12 +82,14 @@ class LiveVideoDetector:
             fps: Desired frames per second (default 30)
             headless: Run without display window (default False)
             confidence_threshold: Confidence threshold for detections (default 0.25)
+            custom_classes: Tuple of custom class names (optional)
         """
         self.model_path = model_path
         self.device_path = device_path
         self.fps = fps
         self.headless = headless
         self.confidence_threshold = confidence_threshold
+        self.custom_classes = custom_classes
         self.cap = None
         self.model = None
         self.platform = None
@@ -186,7 +212,7 @@ class LiveVideoDetector:
                 if len(boxes) > 0:
                     self.total_detections += len(boxes)
                     # Only print detections every 30 frames to reduce overhead
-                    if self.frame_count % 30 == 0:
+                    # if self.frame_count % 30 == 0:
                         # print(f"Frame {self.frame_count}: {len(boxes)} objects")
                     return boxes, classes, scores
             
@@ -195,13 +221,17 @@ class LiveVideoDetector:
             error_str = str(e).lower()
             if 'unknown level' not in error_str and 'warning' not in error_str:
                 print(f"Error during detection: {e}")
+                import traceback
+                traceback.print_exc()
             return None, None, None
     
     def _draw_detections(self, frame, boxes, classes, scores):
         """Draw detection results on frame"""
         if boxes is not None and len(boxes) > 0:
             real_boxes = self.co_helper.get_real_box(boxes)
-            draw(frame, real_boxes, scores, classes, verbose=False)
+            # Use custom classes if provided, otherwise use default CLASSES
+            class_labels = self.custom_classes if self.custom_classes else CLASSES
+            draw(frame, real_boxes, scores, classes, verbose=False, class_labels=class_labels)
         return frame
     
     def _get_system_stats(self):
@@ -388,6 +418,8 @@ def main():
                        help='Run in headless mode without GUI display')
     parser.add_argument('--confidence', type=float, default=0.25,
                        help='Confidence threshold for detections (default: 0.25)')
+    parser.add_argument('--classes', type=str, default=None,
+                       help='Path to custom classes file (one class per line). If not provided, uses COCO classes.')
     
     args = parser.parse_args()
     
@@ -401,6 +433,9 @@ def main():
         else:
             model_path = args.model_path
         
+        # Load custom classes if provided
+        custom_classes = load_custom_classes(args.classes) if args.classes else None
+        
         # Initialize and start detection
         detector = LiveVideoDetector(
             model_path=model_path,
@@ -409,7 +444,8 @@ def main():
             device_id=args.device_id,
             fps=args.fps,
             headless=args.headless,
-            confidence_threshold=args.confidence
+            confidence_threshold=args.confidence,
+            custom_classes=custom_classes
         )
         
         detector.start_detection()

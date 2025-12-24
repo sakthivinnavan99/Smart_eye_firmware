@@ -1,0 +1,6 @@
+path
+obstacle
+ground
+sky
+person
+vehicle

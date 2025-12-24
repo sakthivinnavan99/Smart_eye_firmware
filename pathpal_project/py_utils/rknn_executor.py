@@ -1,3 +1,4 @@
+RKNNLite = False
 try:
     from rknn.api import RKNN
 except ImportError:
@@ -32,5 +33,5 @@ class RKNN_model_container():
             inputs = [inputs]
 
         result = self.rknn.inference(inputs=inputs)
-    
+        
         return result
