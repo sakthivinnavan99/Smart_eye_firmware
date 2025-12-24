@@ -8,7 +8,17 @@ import time
 import os
 import sys
 import numpy as np
+import logging
 from datetime import datetime
+
+# Configure logging to suppress warnings from RKNN and other libraries
+logging.basicConfig(level=logging.ERROR)
+logging.getLogger('rknn').setLevel(logging.ERROR)
+logging.getLogger('tensorflow').setLevel(logging.ERROR)
+
+# Suppress specific warning about logging levels
+logging.captureWarnings(True)
+logging.getLogger('py.warnings').setLevel(logging.ERROR)
 
 # Import YOLOv8 functions
 from yolov8 import (
@@ -18,7 +28,7 @@ from py_utils.coco_utils import COCO_test_helper
 
 
 class ObjectDetection:
-    def __init__(self, model_path, device_path="/dev/video11", target='rk3588', device_id=None, fps=30):
+    def __init__(self, model_path, device_path="/dev/video11", target='rk3588', device_id=None, fps=30, headless=False):
         """
         Initialize Object Detection with camera and model
         
@@ -28,10 +38,12 @@ class ObjectDetection:
             target: Target RKNPU platform (default rk3566)
             device_id: Device ID for RKNN (default None)
             fps: Desired frames per second (default 30)
+            headless: Run without display window (default False)
         """
         self.model_path = model_path
         self.device_path = device_path
         self.fps = fps
+        self.headless = headless
         self.cap = None
         self.model = None
         self.platform = None
@@ -73,8 +85,8 @@ class ObjectDetection:
                 raise RuntimeError(f"Failed to open camera device: {self.device_path}")
             
             # Set camera properties
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
             self.cap.set(cv2.CAP_PROP_FPS, self.fps)
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffer for lower latency
             
@@ -151,9 +163,21 @@ class ObjectDetection:
             
             # Post-process results
             boxes, classes, scores = post_process(outputs)
+            
+            # Print detected objects
+            if boxes is not None and len(boxes) > 0:
+                print(f"\n[Frame {self.frame_count}] Detected {len(boxes)} object(s):")
+                for i, (box, cls_idx, score) in enumerate(zip(boxes, classes, scores)):
+                    class_name = CLASSES[int(cls_idx)] if int(cls_idx) < len(CLASSES) else "Unknown"
+                    x1, y1, x2, y2 = box
+                    print(f"  [{i+1}] {class_name} - Confidence: {score:.2%} - Box: ({x1:.1f}, {y1:.1f}, {x2:.1f}, {y2:.1f})")
+            
             return boxes, classes, scores
         except Exception as e:
-            print(f"Error during detection: {e}")
+            # Only print non-warning-level errors
+            error_str = str(e).lower()
+            if 'unknown level' not in error_str and 'warning' not in error_str:
+                print(f"Error during detection: {e}")
             return None, None, None
     
     def _draw_detections(self, frame, boxes, classes, scores):
@@ -228,7 +252,8 @@ class ObjectDetection:
         """
         try:
             print(f"\nStarting live object detection from {self.device_path}")
-            print("Press 'q' to quit, 's' to save current frame")
+            if not self.headless:
+                print("Press 'q' to quit, 's' to save current frame")
             print("-" * 50)
             
             while True:
@@ -250,26 +275,31 @@ class ObjectDetection:
                 # Draw info overlay
                 frame = self._draw_info_overlay(frame)
                 
-                # Display frame
-                cv2.imshow(window_name, frame)
+                # Display frame (skip in headless mode)
+                if not self.headless:
+                    cv2.imshow(window_name, frame)
                 
-                # Handle key press
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
-                    print("\nQuitting...")
-                    break
-                elif key == ord('s'):
-                    filename = f"detection_{self.frame_count}_{int(time.time())}.jpg"
-                    cv2.imwrite(filename, frame)
-                    print(f"Frame saved: {filename}")
+                # Handle key press (only if not headless)
+                if not self.headless:
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord('q'):
+                        print("\nQuitting...")
+                        break
+                    elif key == ord('s'):
+                        filename = f"detection_{self.frame_count}_{int(time.time())}.jpg"
+                        cv2.imwrite(filename, frame)
+                        print(f"Frame saved: {filename}")
         
         except KeyboardInterrupt:
             print("\nInterrupted by user")
         except Exception as e:
             print(f"Error during detection: {e}")
+            import traceback
+            traceback.print_exc()
         finally:
             self.close()
-            cv2.destroyAllWindows()
+            if not self.headless:
+                cv2.destroyAllWindows()
             print(f"\nDetection session ended")
             print(f"Total frames processed: {self.frame_count}")
             if self.frame_count > 0:
@@ -301,6 +331,8 @@ def main():
                        help='Device ID for RKNN (default: None)')
     parser.add_argument('--fps', type=int, default=30,
                        help='Desired FPS (default: 30)')
+    parser.add_argument('--headless', action='store_true',
+                       help='Run in headless mode without GUI display')
     
     args = parser.parse_args()
     
@@ -320,7 +352,8 @@ def main():
             device_path=args.device,
             target=args.target,
             device_id=args.device_id,
-            fps=args.fps
+            fps=args.fps,
+            headless=args.headless
         )
         
         detector.start_detection()

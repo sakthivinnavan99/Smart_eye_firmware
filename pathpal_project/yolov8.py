@@ -2,6 +2,20 @@ import os
 import cv2
 import sys
 import argparse
+import logging
+
+# Configure logging before importing torch to avoid "Unknown level: 'WARNING'" error
+logging.basicConfig(level=logging.ERROR)
+for logger_name in ['torch', 'torchvision', 'rknn', 'tensorflow']:
+    logging.getLogger(logger_name).setLevel(logging.ERROR)
+
+# Import torch at module level with error handling
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except Exception as e:
+    TORCH_AVAILABLE = False
+    print(f"Warning: PyTorch not available: {e}")
 
 # add path
 realpath = os.path.abspath(__file__)
@@ -15,7 +29,6 @@ import numpy as np
 
 OBJ_THRESH = 0.25
 NMS_THRESH = 0.45
-
 # The follew two param is for map test
 # OBJ_THRESH = 0.001
 # NMS_THRESH = 0.65
@@ -87,7 +100,9 @@ def nms_boxes(boxes, scores):
 
 def dfl(position):
     # Distribution Focal Loss (DFL)
-    import torch
+    if not TORCH_AVAILABLE:
+        raise RuntimeError("PyTorch is required for DFL operation but not available")
+    
     x = torch.tensor(position)
     n,c,h,w = x.shape
     p_num = 4
