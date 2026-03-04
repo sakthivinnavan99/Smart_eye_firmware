@@ -1,408 +1,276 @@
-# Smart Eye Carrier Board - Device Tree Overlay
+# Smart Eye Carrier Board - Device Tree Overlay & Power Management
 
-Custom device tree overlay for the Radxa CM5 on the Smart Eye carrier PCB.
-Configures PWM, I2C, UART, and GPIO peripherals at kernel level.
+Custom device tree overlay and power management system for the Radxa CM5
+on the Smart Eye carrier PCB. Configures PWM, I2C, UART, GPIO, audio,
+and battery charging/monitoring peripherals at kernel level.
 
 ## Pin Map
 
-| Signal Name       | RK3588 Pin | Linux GPIO# | Function                        | Direction  |
-|-------------------|------------|-------------|---------------------------------|------------|
-| VIBRATION_PWM15_M1| GPIO4_B3   | 139         | Vibration motor (hardware PWM)  | Output     |
-| I2C3_SCL_M1_CHG   | GPIO3_B7   | 111         | BQ27220 fuel gauge clock        | I2C SCL    |
-| I2C3_SDA_M1_CHG   | GPIO3_C0   | 112         | BQ27220 fuel gauge data         | I2C SDA    |
-| GPIO4_A4          | GPIO4_A4   | 132         | BQ27220 interrupt/alert         | Input (pull-up, falling edge) |
-| UART6_TX_M2_S     | GPIO1_D1   | 57          | UART6 transmit                  | Output     |
-| UART6_RX_M2_S     | GPIO1_D0   | 56          | UART6 receive                   | Input      |
-| CHG_INT0_L        | GPIO0_D3   | 27          | Charger interrupt               | Input (pull-up, active low) |
-| LANG_BTN          | GPIO0_D0   | 24          | Language select button           | Input (pull-up, active low) |
-| OCR_BTN           | GPIO0_C7   | 23          | OCR trigger button               | Input (pull-up, active low) |
+| Signal              | RK3588 Pin | GPIO# | Function                         | Direction / Type              |
+|---------------------|------------|-------|----------------------------------|-------------------------------|
+| VIBRATION_PWM7_M1   | GPIO4_B3   | 139   | Vibration motor (hardware PWM)   | Output (PWM)                  |
+| I2C3_SCL_M1_CHG     | GPIO3_B7   | 111   | BQ27220 / BQ25895 I2C clock      | I2C SCL                       |
+| I2C3_SDA_M1_CHG     | GPIO3_C0   | 112   | BQ27220 / BQ25895 I2C data       | I2C SDA                       |
+| BQ27220_GPOUT       | GPIO4_A4   | 132   | Fuel gauge interrupt/alert       | Input (pull-up, falling edge) |
+| CHG_INT0_L          | GPIO0_D3   | 27    | BQ25895 charger interrupt        | Input (pull-up, falling edge) |
+| UART6_TX_M2_S       | GPIO1_D1   | 57    | UART6 transmit                   | Output                        |
+| UART6_RX_M2_S       | GPIO1_D0   | 56    | UART6 receive                    | Input                         |
+| LANG_BTN            | GPIO0_D0   | 24    | Language select button            | Input (pull-up, active low)   |
+| OCR_BTN             | GPIO0_C7   | 23    | OCR trigger button                | Input (pull-up, active low)   |
+| AMP_SD (SD_MODE)    | GPIO4_A3   | 131   | MAX98357A speaker enable         | Output (active high)          |
+| I2S1_SCLK_M0        | GPIO4_A1   | 129   | I2S1 bit clock                   | Output                        |
+| I2S1_LRCK_M0        | GPIO4_A2   | 130   | I2S1 frame clock                 | Output                        |
+| I2S1_SDO1_M0        | GPIO4_B2   | 138   | I2S1 data out (to MAX98357A)     | Output                        |
+
+## Power Management ICs
+
+### Hardware
+
+| IC              | Part Number    | I2C Addr | Function                      |
+|-----------------|----------------|----------|-------------------------------|
+| U2              | BQ25895RTWR    | 0x6A     | 1S 5A buck charger            |
+| U20             | BQ27220YZFR    | 0x55     | CEDV fuel gauge               |
+| U15             | BQ29700DSER    | --       | Battery protection (HW only)  |
+| R77             | 10 mΩ          | --       | Current sense resistor        |
+
+### BQ25895 Charger Configuration
+
+Applied by `power_config.py` and re-applied on every boot by the battery daemon:
+
+| Parameter                | Value   | Register |
+|--------------------------|---------|----------|
+| Input Current Limit      | 2000 mA | REG00    |
+| Fast Charge Current      | 2048 mA | REG04    |
+| Charge Voltage           | 4208 mV | REG06    |
+| Minimum System Voltage   | 3500 mV | REG03    |
+| Watchdog Timer           | OFF     | REG07    |
+| Safety Timer             | 20 h    | REG07    |
+| BATFET Delay (ship mode) | 10 s    | REG09    |
+
+### BQ27220 Fuel Gauge Configuration
+
+CEDV Data Memory parameters written via MAC commands by `power_config.py`:
+
+| Parameter         | Value     | DM Address |
+|-------------------|-----------|------------|
+| Design Capacity   | 10000 mAh | 0x929C     |
+| Design Energy     | 3700 cWh  | 0x929E     |
+| Terminate Voltage | 3000 mV   | 0x9280     |
+| Taper Rate        | 217       | 0x9282     |
+
+## Battery Management Daemon
+
+A systemd service (`battery-mgr.service`) runs `/opt/battery-mgr/battery_daemon.py`
+to continuously monitor battery health and enforce safety limits.
+
+### Monitoring
+
+- Polls BQ27220 every 30 seconds for SOC, voltage, current, temperature
+- Logs detailed status to `/var/log/battery-mgr.log` every 5 minutes
+- Re-applies BQ25895 register configuration on startup
+
+### Protection Thresholds
+
+| Condition                  | Action                                        |
+|----------------------------|-----------------------------------------------|
+| SOC ≤ 20%                  | Warning broadcast via `wall`                  |
+| SOC ≤ 15%                  | Clean shutdown + ship mode                    |
+| SOC ≤ 10%                  | Immediate shutdown + ship mode                |
+| Cell voltage < 3.2 V       | Immediate shutdown + ship mode                |
+| Temperature > 60°C         | Immediate shutdown + ship mode                |
+
+### Ship Mode
+
+Ship mode disconnects the battery from the system via BQ25895 BATFET to
+prevent idle current drain when powered off. Re-enables automatically
+when a USB charger is plugged in.
+
+- Triggered by the daemon on low-battery shutdown
+- Also triggered by `ship-mode-shutdown.service` during every poweroff
+  (skipped if USB charger is connected)
+- Manual entry: `sudo python3 /opt/battery-mgr/ship_mode.py --force`
+
+### Installed Files
+
+```
+/opt/battery-mgr/
+├── battery_daemon.py          # Main monitoring daemon
+├── ship_mode.py               # Manual ship mode entry
+└── shutdown_ship_mode.sh      # Shutdown hook (vibration + ship mode)
+
+/etc/systemd/system/
+├── battery-mgr.service        # Daemon unit (After=multi-user.target)
+└── ship-mode-shutdown.service  # Shutdown hook (Before=poweroff.target)
+```
+
+## Power Button Behavior
+
+The RK806 PMIC `pwrkey` generates `KEY_POWER` events on `/dev/input/event0`.
+
+| Action           | Result   |
+|------------------|----------|
+| Short press      | Poweroff |
+| Long press       | Poweroff |
+
+Configuration files:
+
+- `/etc/systemd/logind.conf.d/power-button.conf` -- sets `HandlePowerKey=poweroff`
+  and `PowerKeyIgnoreInhibited=yes` to bypass GNOME desktop interception
+- `/etc/dconf/db/gdm.d/10-power-button` -- sets GNOME `power-button-action=nothing`
+- `/etc/dconf/db/local.d/10-power-button` -- same for all user sessions
+
+## Shutdown Sequence
+
+When poweroff is initiated (by power button, low battery, or `systemctl poweroff`):
+
+1. Systemd begins shutdown, reaches `ship-mode-shutdown.service`
+2. Vibration motor produces **3 short buzzes** (150 ms on, 100 ms off) as
+   tactile feedback via PWM7 (`/sys/class/pwm/pwmchip0`)
+3. Script checks BQ25895 for USB charger presence:
+   - **Charger connected**: skips ship mode, system powers off normally
+   - **No charger**: writes `0x6C` to BQ25895 REG09 to disconnect BATFET
+     with 10-second delay, preventing battery drain while off
+4. Systemd completes poweroff
+
+## Audio: MAX98357A Speaker on I2S1
+
+The overlay configures a MAX98357A I2S DAC amplifier on I2S1-M0:
+
+| Signal     | RK3588 Pin | MAX98357A Pin |
+|------------|------------|---------------|
+| I2S1_SCLK  | GPIO4_A1   | BCLK          |
+| I2S1_LRCK  | GPIO4_A2   | LRCLK         |
+| I2S1_SDO1  | GPIO4_B2   | DIN           |
+| SD_MODE    | GPIO4_A3   | SD_MODE       |
+
+The `i2s-tx-route = <1 0 2 3>` setting swaps SDO0/SDO1 so audio data
+goes out SDO1 (GPIO4_B2) to the MAX98357A DIN pin.
+
+```bash
+# Test speaker output
+aplay -D plughw:CARD=SmartEyeAudio,DEV=0 /usr/share/sounds/alsa/Front_Center.wav
+
+# Check sound card
+aplay -l | grep Smart
+```
 
 ## GPIO4_B3 Boot-High Fix (Vibration Motor)
 
-**Problem:** GPIO4_B3 (`PI_nLED_Activity` on the CM5 connector) defaults
-to a high state at power-on due to the RK3588 boot ROM / U-Boot
-initialization. On the custom carrier board this pin drives the vibration
-motor, causing it to run continuously during and after boot until the PWM
-driver takes over.
+RK3588 GPIO4_B3 floats high at power-on, briefly activating the vibration
+motor before the PWM driver loads. Fix options:
 
-**Solution:** The overlay applies two fixes:
+**Option A (hardware, recommended):** Add a 47K–100K pull-down resistor
+from the MOSFET gate to GND on the carrier PCB.
 
-1. **gpio-hog** (fragment@1) -- Adds a `gpio-hog` child node to the `gpio4`
-   controller that forces GPIO4_B3 **output-low** as soon as the GPIO
-   controller driver initializes (very early in the kernel boot sequence,
-   before most other drivers). This keeps the motor off during boot.
+**Option B (U-Boot):** Run `overlays/setup_uboot_gpio_fix.sh` to configure
+U-Boot `preboot` to drive GPIO 139 low before Linux loads.
 
-2. **gpio-leds disabled** (fragment@0) -- Disables the CM5-IO `gpio-leds`
-   node (heartbeat LED on adjacent GPIO4_B4) to prevent the LED driver
-   from interfering with GPIO bank 4 on the custom carrier.
-
-After applying the overlay:
-- GPIO4_B3 is driven low immediately when the GPIO4 controller probes
-- The vibration motor stays off until your application enables PWM
-- `/sys/class/leds/status-led-blue` will no longer exist
-- PWM15-M1 takes over the pin mux when the PWM driver loads later in boot
-
-## Prerequisites
+## Quick Reference
 
 ```bash
-sudo apt install device-tree-compiler
-```
+# Full power system configuration (run once)
+sudo python3 ~/Smart_eye_firmware/power_config.py
 
-## Build and Install
+# Check power system status
+sudo python3 ~/Smart_eye_firmware/power_config.py --status
 
-```bash
-cd ~/Smart_eye_firmware/overlays
+# View battery daemon log
+tail -f /var/log/battery-mgr.log
 
-# Compile the overlay
-make
+# Check daemon health
+systemctl status battery-mgr.service
 
-# Install to system overlay directories
-sudo make install
+# Manual ship mode (battery disconnect)
+sudo python3 /opt/battery-mgr/ship_mode.py --force
 
-# Enable for next boot
-sudo make enable
-
-# Reboot to apply
-sudo reboot
-```
-
-## Makefile Targets
-
-| Target    | Description                                     |
-|-----------|-------------------------------------------------|
-| `make`    | Compile `.dts` to `.dtbo`                       |
-| `make install` | Copy `.dtbo` to system overlay directories |
-| `make enable`  | Enable overlay for next boot                |
-| `make disable` | Disable overlay (reboot required)           |
-| `make status`  | Show current overlay state and pin listing  |
-| `make clean`   | Remove compiled files                       |
-
-## Verification After Reboot
-
-### Check overlay was loaded
-
-```bash
-sudo dmesg | grep -i "overlay\|pwm15\|i2c3\|uart6\|bq27\|gpio-keys"
-```
-
-### PWM15 (vibration motor)
-
-After the overlay loads, PWM15 appears under sysfs. The channel index depends
-on how many PWM controllers are already enabled.
-
-```bash
-# Find the pwmchip that corresponds to PWM15
-# PWM15 is at register 0xfebf0030
-ls /sys/class/pwm/
-
-# Export the channel and test
-echo 0 | sudo tee /sys/class/pwm/pwmchipN/export
-echo 2000000 | sudo tee /sys/class/pwm/pwmchipN/pwm0/period      # 500 Hz
-echo 1000000 | sudo tee /sys/class/pwm/pwmchipN/pwm0/duty_cycle   # 50%
-echo 1 | sudo tee /sys/class/pwm/pwmchipN/pwm0/enable
-```
-
-Python usage (after identifying the correct pwmchip):
-
-```python
-import os
-
-PWM_CHIP = "/sys/class/pwm/pwmchipN"  # replace N with actual chip number
-PWM_CH   = PWM_CHIP + "/pwm0"
-
-def pwm_init(freq_hz=500):
-    if not os.path.exists(PWM_CH):
-        with open(PWM_CHIP + "/export", "w") as f:
-            f.write("0")
-    period_ns = int(1e9 / freq_hz)
-    with open(PWM_CH + "/period", "w") as f:
-        f.write(str(period_ns))
-
-def pwm_set_duty(percent):
-    """Set duty cycle 0-100."""
-    period = int(open(PWM_CH + "/period").read())
-    duty = int(period * percent / 100)
-    with open(PWM_CH + "/duty_cycle", "w") as f:
-        f.write(str(duty))
-
-def pwm_enable(on=True):
-    with open(PWM_CH + "/enable", "w") as f:
-        f.write("1" if on else "0")
-```
-
-### I2C3 (BQ27220 fuel gauge)
-
-```bash
-# Scan I2C3 bus - BQ27220 should appear at address 0x55
+# Scan I2C bus 3
 sudo i2cdetect -y 3
 
-# Read voltage register (0x04) as a quick test
-sudo i2cget -y 3 0x55 0x04 w
-```
+# Read BQ25895 charger status
+sudo i2cget -y 3 0x6a 0x0b b
 
-Python usage:
-
-```python
-import smbus2
-
-bus = smbus2.SMBus(3)
-BQ27220_ADDR = 0x55
-
-def read_voltage():
-    """Read battery voltage in mV."""
-    raw = bus.read_word_data(BQ27220_ADDR, 0x04)
-    return raw  # value in mV
-
-def read_soc():
-    """Read state of charge in percent."""
-    raw = bus.read_word_data(BQ27220_ADDR, 0x1C)
-    return raw  # value in %
-
-def read_current():
-    """Read average current in mA (signed)."""
-    import struct
-    raw = bus.read_word_data(BQ27220_ADDR, 0x10)
-    return struct.unpack('h', struct.pack('H', raw))[0]  # signed
-
-def read_temperature():
-    """Read temperature in 0.1 K, convert to Celsius."""
-    raw = bus.read_word_data(BQ27220_ADDR, 0x06)
-    return (raw * 0.1) - 273.15
-```
-
-### UART6
-
-```bash
-# UART6 appears as /dev/ttyS6
-ls -l /dev/ttyS6
-
-# Quick loopback test (connect TX to RX)
-stty -F /dev/ttyS6 9600 cs8 -cstopb -parenb
-echo "hello" > /dev/ttyS6
-cat /dev/ttyS6
-```
-
-Python usage:
-
-```python
-import serial
-
-uart6 = serial.Serial(
-    port="/dev/ttyS6",
-    baudrate=9600,
-    bytesize=serial.EIGHTBITS,
-    stopbits=serial.STOPBITS_ONE,
-    parity=serial.PARITY_NONE,
-    timeout=1
-)
-
-uart6.write(b"hello\n")
-response = uart6.readline()
-```
-
-### GPIO Buttons and Charger Interrupt
-
-The overlay registers LANG_BTN, OCR_BTN, and CHG_INT0_L as `gpio-keys`
-input devices. They appear as `/dev/input/eventX` devices automatically.
-
-```bash
-# Find the input devices
-cat /proc/bus/input/devices | grep -A4 "smart-eye"
-
-# Test with evtest (install: sudo apt install evtest)
-sudo evtest /dev/input/eventX
-# Press buttons to see events
-```
-
-Python usage with evdev:
-
-```python
-# sudo apt install python3-evdev
-# pip install evdev
-import evdev
-import select
-
-def find_smart_eye_inputs():
-    """Find input devices created by the overlay."""
-    devices = {}
-    for path in evdev.list_devices():
-        dev = evdev.InputDevice(path)
-        if "smart-eye" in dev.name.lower() or dev.name in ("LANG_BTN", "OCR_BTN", "CHG_INT0_L"):
-            devices[dev.name] = dev
-    return devices
-
-def poll_buttons():
-    """Poll for button press events."""
-    devices = find_smart_eye_inputs()
-    if not devices:
-        print("No Smart Eye input devices found")
-        return
-
-    print(f"Monitoring: {list(devices.keys())}")
-    devs = list(devices.values())
-
-    while True:
-        r, _, _ = select.select(devs, [], [])
-        for dev in r:
-            for event in dev.read():
-                if event.type == evdev.ecodes.EV_KEY:
-                    key = evdev.ecodes.KEY.get(event.code) or evdev.ecodes.BTN.get(event.code) or event.code
-                    state = "pressed" if event.value == 1 else "released" if event.value == 0 else "held"
-                    print(f"{dev.name}: {key} {state}")
-```
-
-Alternative: direct GPIO sysfs access (without gpio-keys driver):
-
-```python
-import RPi.GPIO as GPIO
-
-GPIO.setmode(GPIO.BCM)
-
-LANG_BTN_PIN = 24    # GPIO0_D0
-OCR_BTN_PIN  = 23    # GPIO0_C7
-CHG_INT_PIN  = 27    # GPIO0_D3
-
-GPIO.setup(LANG_BTN_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-GPIO.setup(OCR_BTN_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-GPIO.setup(CHG_INT_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-
-def on_lang_btn(channel):
-    print("Language button pressed")
-
-def on_ocr_btn(channel):
-    print("OCR button pressed")
-
-def on_chg_int(channel):
-    print("Charger interrupt triggered")
-
-GPIO.add_event_detect(LANG_BTN_PIN, GPIO.FALLING, callback=on_lang_btn, bouncetime=200)
-GPIO.add_event_detect(OCR_BTN_PIN, GPIO.FALLING, callback=on_ocr_btn, bouncetime=200)
-GPIO.add_event_detect(CHG_INT_PIN, GPIO.FALLING, callback=on_chg_int, bouncetime=200)
-```
-
-### BQ27220 Fuel Gauge Interrupt (GPIO4_A4)
-
-The interrupt is wired directly to the BQ27220 I2C device node in the
-overlay. The kernel's `bq27xxx_battery` driver handles it automatically
-if loaded. To check:
-
-```bash
-# Verify the interrupt is registered
-cat /proc/interrupts | grep bq27
-
-# Check power supply class device
-ls /sys/class/power_supply/
-cat /sys/class/power_supply/bq27220-*/uevent
-```
-
-If the kernel driver is not available, read the interrupt GPIO manually:
-
-```python
-import RPi.GPIO as GPIO
-
-GPIO.setmode(GPIO.BCM)
-BQ_INT_PIN = 132  # GPIO4_A4 (sysfs number, not BCM)
-
-# Using sysfs directly for GPIO4 bank pins
-import os
-
-def read_bq_interrupt():
-    gpio_path = "/sys/class/gpio/gpio132"
-    if not os.path.exists(gpio_path):
-        with open("/sys/class/gpio/export", "w") as f:
-            f.write("132")
-        with open(gpio_path + "/direction", "w") as f:
-            f.write("in")
-    with open(gpio_path + "/value") as f:
-        return int(f.read().strip())
+# Read BQ27220 SOC
+sudo i2cget -y 3 0x55 0x1c w
 ```
 
 ## Overlay Structure
 
 ```
 overlays/
-  rk3588-smart-eye-carrier.dts   # Device tree overlay source
-  rk3588-smart-eye-carrier.dtbo  # Compiled overlay binary
-  Makefile                        # Build/install/enable/disable automation
-  USAGE.md                        # This file
+├── smart-eye-carrier.dts              # Current overlay (PWM7 + I2C3 + I2S1 + BQ25895)
+├── smart-eye-carrier.dtbo             # Compiled binary
+├── rk3588-smart-eye-carrier.dts       # Legacy overlay (dual-codec variant)
+├── rk3588-smart-eye-carrier.dtbo      # Legacy compiled binary
+├── setup_uboot_gpio_fix.sh            # U-Boot GPIO fix installer
+├── Makefile                           # Build/install/enable/disable
+└── USAGE.md                           # This file
 ```
 
-## Modifying the Overlay
-
-1. Edit `rk3588-smart-eye-carrier.dts`
-2. Recompile and reinstall:
-
-```bash
-make clean && make
-sudo make install
-sudo make enable
-sudo reboot
-```
-
-## Disabling the Overlay
+## Building & Installing the Overlay
 
 ```bash
 cd ~/Smart_eye_firmware/overlays
-sudo make disable
+
+# Compile
+make
+
+# Install to /boot/dtbo/ and enable
+sudo make install
+sudo make enable
+
+# Reboot to apply
 sudo reboot
 ```
 
 ## Troubleshooting
 
+**Power button does nothing:**
+```bash
+# Check logind sees the key
+journalctl -u systemd-logind | grep -i power
+
+# Verify inhibitors are bypassed
+systemd-inhibit --list
+cat /etc/systemd/logind.conf.d/power-button.conf
+```
+
+**Battery daemon not running:**
+```bash
+systemctl status battery-mgr.service
+journalctl -u battery-mgr.service -n 50
+```
+
+**Charger/fuel gauge not detected on I2C:**
+```bash
+sudo i2cdetect -y 3
+# Expected: 0x55 (BQ27220) and 0x6a (BQ25895)
+```
+
+**Vibration motor runs at boot:**
+```bash
+# Check if U-Boot fix is applied
+sudo fw_printenv preboot
+# Should show: gpio clear 139
+```
+
 **Overlay not loading:**
 ```bash
-# Check if the overlay file exists in boot
-ls -l /boot/dtbo/rk3588-smart-eye-carrier.dtbo*
-
-# Check managed list
-cat /boot/dtbo/managed.list
-
-# Check kernel log for errors
+ls -l /boot/dtbo/*smart-eye*
+cat /boot/extlinux/extlinux.conf | grep overlay
 sudo dmesg | grep -i "overlay\|dtbo\|error"
-```
-
-**I2C device not detected:**
-```bash
-# Verify I2C3 bus exists
-ls /dev/i2c-*
-
-# Scan with verbose output
-sudo i2cdetect -y 3
-
-# Check if pins are muxed correctly
-sudo cat /sys/kernel/debug/pinctrl/pinctrl-rockchip-pinctrl/pinmux-pins | grep -i i2c3
-```
-
-**UART not available:**
-```bash
-# Check if UART6 device exists
-ls -l /dev/ttyS6
-
-# Verify pin mux
-sudo cat /sys/kernel/debug/pinctrl/pinctrl-rockchip-pinctrl/pinmux-pins | grep -i uart6
 ```
 
 **PWM not appearing:**
 ```bash
-# List all PWM chips
 ls /sys/class/pwm/
-
-# Check which PWMs are registered
 for chip in /sys/class/pwm/pwmchip*/; do
     echo "$chip: npwm=$(cat ${chip}npwm) device=$(readlink -f ${chip}device)"
 done
 ```
 
-**Buttons not responding:**
+**Audio not working:**
 ```bash
-# List all input devices
-cat /proc/bus/input/devices
-
-# Check gpio-keys driver
-sudo dmesg | grep -i gpio-keys
-
-# Verify GPIO state directly
-sudo gpioget gpiochip0 23   # OCR_BTN
-sudo gpioget gpiochip0 24   # LANG_BTN
-sudo gpioget gpiochip0 27   # CHG_INT0_L
+aplay -l
+sudo dmesg | grep -i "i2s\|max98357\|sound\|audio"
+cat /proc/asound/cards
 ```

@@ -66,3 +66,6 @@ status:
 	@echo "  GPIO0_D3  CHG_INT0_L          -> Charger interrupt (active low)"
 	@echo "  GPIO0_D0  LANG_BTN            -> Language select button (active low)"
 	@echo "  GPIO0_C7  OCR_BTN             -> OCR trigger button (active low)"
+	@echo "  I2S0      ES8316 + MAX98357A  -> Headphone + Speaker (auto-switch)"
+	@echo "  GPIO4_A3  AMP_SD             -> MAX98357A speaker enable"
+	@echo "  GPIO1_C0  HP_DET             -> Headphone jack detect"

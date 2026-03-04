@@ -41,6 +41,11 @@ TESTS = [
         "cmd": [sys.executable, os.path.join(TESTS_DIR, "test_buttons.py")],
         "interactive": True,
     },
+    {
+        "name": "RPi Camera v2 (IMX219)",
+        "cmd": [sys.executable, os.path.join(TESTS_DIR, "test_camera.py")],
+        "interactive": False,
+    },
 ]
 
 
