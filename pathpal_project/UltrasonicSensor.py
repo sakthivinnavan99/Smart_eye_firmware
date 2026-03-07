@@ -16,12 +16,12 @@ import time
 import struct
 
 class UltrasonicSensor:
-    def __init__(self, device="/dev/ttyS2", baud_rate=9600):
+    def __init__(self, device="/dev/ttyS6", baud_rate=9600):
         """
         Initialize the ultrasonic sensor via PySerial
         
         Args:
-            device: Serial device path (default "/dev/ttyS2")
+            device: Serial device path (default "/dev/ttyS6")
             baud_rate: Serial baud rate (default 9600)
         """
         try:

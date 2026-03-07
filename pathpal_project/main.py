@@ -4,15 +4,16 @@ Smart Eye Firmware - Main Application
 ======================================
 Assistive vision system for visually impaired users.
 
-Hardware platform: Radxa CM5 (RK3588) on Smart Eye carrier board
+Hardware platform: Radxa CM5 (RK3588S) on Smart Eye carrier board
   - Camera:      IMX219 via V4L2 (/dev/video11)
   - Inference:   YOLOv8 on RKNN NPU
   - Audio:       MAX98357A on ALSA Smart-Eye-Audio (card 2)
   - Buttons:     LANG_BTN (GPIO0_D0), OCR_BTN (GPIO0_C7) via gpio-keys
   - Vibration:   PWM7 on GPIO4_B3 via sysfs
-  - Ultrasonic:  JSN-SR04T on UART6 (/dev/ttyS6)
+  - Ultrasonic1: AJ-SR04M on UART2 (/dev/ttyS2) - forward facing (J8)
+  - Ultrasonic2: AJ-SR04M on UART6 (/dev/ttyS6) - downward
   - Battery:     BQ27220 fuel gauge on I2C3 (0x55)
-  - OCR:         PaddleOCR
+  - OCR:         RapidOCR (onnxruntime)
   - Translation: argostranslate (English <-> Hindi)
 """
 
@@ -34,8 +35,10 @@ import cv2
 import numpy as np
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ.setdefault("OMP_NUM_THREADS", "4")
+os.environ.setdefault("ORT_GLOBAL_THREAD_POOL_SIZE", "4")
 
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,81 +48,242 @@ log = logging.getLogger("smart-eye")
 
 
 # ---------------------------------------------------------------------------
-#  Hardware abstraction: Vibration motor (PWM sysfs)
+#  System-level power optimizations (applied once at startup)
 # ---------------------------------------------------------------------------
-class VibrationMotor:
-    """Control vibration motor via sysfs PWM (pwmchip0, GPIO4_B3)."""
+def _apply_power_profile():
+    """Reduce SoC power consumption by tuning governors, disabling unused
+    peripherals, and stopping unnecessary services.  Safe to call as root;
+    silently skips anything that doesn't exist or fails."""
 
-    PWM_REG = "febd0"
-
-    def __init__(self):
-        self.chip = self._find_chip()
-        self.pwm_dir = None
-        if self.chip:
-            self._export()
-
-    def _find_chip(self):
-        for p in sorted(glob.glob("/sys/class/pwm/pwmchip*")):
-            try:
-                link = os.readlink(os.path.join(p, "device"))
-                if self.PWM_REG in link:
-                    return p
-            except OSError:
-                pass
-        log.warning("PWM chip for vibration motor not found")
-        return None
-
-    def _export(self):
-        self.pwm_dir = os.path.join(self.chip, "pwm0")
-        if not os.path.isdir(self.pwm_dir):
-            try:
-                with open(os.path.join(self.chip, "export"), "w") as f:
-                    f.write("0")
-                time.sleep(0.1)
-            except OSError:
-                log.warning("Cannot export PWM channel")
-                self.pwm_dir = None
-                return
-        self._write("period", "2000000")  # 500 Hz
-        self._write("duty_cycle", "0")
-
-    def _write(self, attr, val):
-        if not self.pwm_dir:
-            return
+    def _write(path, val):
         try:
-            with open(os.path.join(self.pwm_dir, attr), "w") as f:
+            with open(path, "w") as f:
                 f.write(val)
         except OSError:
             pass
 
-    def buzz(self, duration_ms, duty_pct=50):
-        if not self.pwm_dir:
+    def _read(path):
+        try:
+            with open(path) as f:
+                return f.read().strip()
+        except OSError:
+            return ""
+
+    # -- CPU: switch big cores (cpu4-7) to powersave, keep little cores
+    #    on conservative.  All cores stay online because onnxruntime crashes
+    #    with a vector OOB if it tries to set thread affinity on offline cores.
+    for cpu in range(8):
+        base = f"/sys/devices/system/cpu/cpu{cpu}/cpufreq"
+        if cpu < 4:
+            _write(f"{base}/scaling_governor", "conservative")
+        else:
+            _write(f"{base}/scaling_governor", "powersave")
+
+    # -- GPU: drop to lowest frequency since we don't use the GPU at all
+    for gpu_path in glob.glob("/sys/class/devfreq/*gpu*"):
+        avail = _read(f"{gpu_path}/available_frequencies")
+        if avail:
+            lowest = avail.split()[0]
+            _write(f"{gpu_path}/governor", "userspace")
+            _write(f"{gpu_path}/userspace/set_freq", lowest)
+
+    # -- NPU: use on-demand (already default), but cap idle frequency
+    for npu_path in glob.glob("/sys/class/devfreq/*npu*"):
+        _write(f"{npu_path}/governor", "rknpu_ondemand")
+
+    # -- Disable unused services that consume CPU/RAM
+    _stopped = []
+    for svc in [
+        "cups.service",
+        "packagekit.service",
+        "avahi-daemon.service",
+        "wpa_supplicant.service",
+        "gdm.service",
+        "ModemManager.service",
+        "bluetooth.service",
+    ]:
+        ret = subprocess.run(
+            ["systemctl", "stop", svc],
+            capture_output=True, timeout=5,
+        )
+        if ret.returncode == 0:
+            _stopped.append(svc)
+
+    if _stopped:
+        log.info("Stopped unused services: %s", ", ".join(_stopped))
+
+    # -- Disable HDMI output (both ports are disconnected)
+    for card in glob.glob("/sys/class/drm/card*-HDMI*"):
+        _write(os.path.join(card, "enabled"), "disabled")
+    for card in glob.glob("/sys/class/drm/card*-DP*"):
+        _write(os.path.join(card, "enabled"), "disabled")
+
+    log.info("Power profile applied (big cores powersave, GPU min, unused services stopped)")
+
+
+# ---------------------------------------------------------------------------
+#  Hardware abstraction: Vibration motor (PWM sysfs with GPIO fallback)
+# ---------------------------------------------------------------------------
+_VIB_PWM_REG = "febd0030"
+_VIB_GPIO = 139                # GPIO4_B3 — shared with PWM7-M1
+
+
+class VibrationMotor:
+    """Control vibration motor on GPIO4_B3.
+
+    Primary mode: PWM via sysfs (variable intensity).
+    Fallback mode: GPIO on/off (if PWM chip unavailable).
+
+    The init service or a previous run may hold GPIO 139 via sysfs,
+    which prevents the PWM pinctrl from claiming the pin.  We release
+    it first so the PWM controller can take over.
+    """
+
+    def __init__(self):
+        self._mode = None       # "pwm" | "gpio"
+        self._pwm_dir = None
+        self._gpio_val = None
+
+        self._release_gpio()
+        chip = self._find_pwm_chip()
+        if chip:
+            self._init_pwm(chip)
+        if self._mode is None:
+            self._init_gpio_fallback()
+
+    # -- GPIO release (so PWM pinctrl can claim the pin) --------------------
+
+    @staticmethod
+    def _release_gpio():
+        gpath = f"/sys/class/gpio/gpio{_VIB_GPIO}"
+        if os.path.exists(gpath):
+            try:
+                with open("/sys/class/gpio/unexport", "w") as f:
+                    f.write(str(_VIB_GPIO))
+                time.sleep(0.1)
+                log.info("Released GPIO %d for PWM", _VIB_GPIO)
+            except OSError:
+                pass
+
+    # -- PWM chip discovery -------------------------------------------------
+
+    @staticmethod
+    def _find_pwm_chip():
+        for p in sorted(glob.glob("/sys/class/pwm/pwmchip*")):
+            try:
+                link = os.readlink(os.path.join(p, "device"))
+                if _VIB_PWM_REG in link:
+                    return p
+            except OSError:
+                pass
+            try:
+                with open(os.path.join(p, "device", "uevent")) as f:
+                    if _VIB_PWM_REG in f.read():
+                        return p
+            except (OSError, FileNotFoundError):
+                pass
+        return None
+
+    # -- PWM init -----------------------------------------------------------
+
+    def _init_pwm(self, chip):
+        self._pwm_dir = os.path.join(chip, "pwm0")
+        if not os.path.isdir(self._pwm_dir):
+            try:
+                with open(os.path.join(chip, "export"), "w") as f:
+                    f.write("0")
+                time.sleep(0.1)
+            except OSError:
+                log.warning("Cannot export PWM channel, falling back to GPIO")
+                self._pwm_dir = None
+                return
+        self._pwm_write("period", "2000000")    # 500 Hz default
+        self._pwm_write("duty_cycle", "0")
+        self._mode = "pwm"
+        log.info("Vibration motor: PWM mode (%s)", chip)
+
+    def _pwm_write(self, attr, val):
+        if not self._pwm_dir:
             return
-        period = int(self._read("period") or 2000000)
-        duty = int(period * duty_pct / 100)
-        self._write("duty_cycle", str(duty))
-        self._write("enable", "1")
-        time.sleep(duration_ms / 1000.0)
-        self._write("duty_cycle", "0")
-        self._write("enable", "0")
+        try:
+            with open(os.path.join(self._pwm_dir, attr), "w") as f:
+                f.write(val)
+        except OSError:
+            pass
+
+    def _pwm_read(self, attr):
+        if not self._pwm_dir:
+            return None
+        try:
+            with open(os.path.join(self._pwm_dir, attr)) as f:
+                return f.read().strip()
+        except OSError:
+            return None
+
+    # -- GPIO fallback init -------------------------------------------------
+
+    def _init_gpio_fallback(self):
+        gpath = f"/sys/class/gpio/gpio{_VIB_GPIO}"
+        if not os.path.exists(gpath):
+            try:
+                with open("/sys/class/gpio/export", "w") as f:
+                    f.write(str(_VIB_GPIO))
+                time.sleep(0.05)
+            except OSError:
+                log.warning("Vibration motor: neither PWM nor GPIO available")
+                return
+        try:
+            with open(f"{gpath}/direction", "w") as f:
+                f.write("out")
+        except OSError:
+            log.warning("Vibration motor: cannot set GPIO direction")
+            return
+        self._gpio_val = f"{gpath}/value"
+        self._gpio_set(0)
+        self._mode = "gpio"
+        log.info("Vibration motor: GPIO fallback mode (on/off only)")
+
+    def _gpio_set(self, val):
+        if self._gpio_val is None:
+            return
+        try:
+            with open(self._gpio_val, "w") as f:
+                f.write(str(val))
+        except OSError:
+            pass
+
+    # -- Public API (works in both modes) -----------------------------------
+
+    def set_frequency(self, freq_hz):
+        if self._mode == "pwm":
+            period_ns = int(1e9 / freq_hz)
+            self._pwm_write("period", str(period_ns))
+
+    def buzz(self, duration_ms, duty_pct=50):
+        if self._mode == "pwm":
+            period = int(self._pwm_read("period") or 2000000)
+            duty = int(period * max(0, min(100, duty_pct)) / 100)
+            self._pwm_write("duty_cycle", str(duty))
+            self._pwm_write("enable", "1")
+            time.sleep(duration_ms / 1000.0)
+            self._pwm_write("duty_cycle", "0")
+            self._pwm_write("enable", "0")
+        elif self._mode == "gpio":
+            self._gpio_set(1)
+            time.sleep(duration_ms / 1000.0)
+            self._gpio_set(0)
 
     def pulse(self, count=3, on_ms=150, off_ms=100, duty_pct=50):
         for _ in range(count):
             self.buzz(on_ms, duty_pct)
             time.sleep(off_ms / 1000.0)
 
-    def _read(self, attr):
-        if not self.pwm_dir:
-            return None
-        try:
-            with open(os.path.join(self.pwm_dir, attr)) as f:
-                return f.read().strip()
-        except OSError:
-            return None
-
     def cleanup(self):
-        self._write("duty_cycle", "0")
-        self._write("enable", "0")
+        if self._mode == "pwm":
+            self._pwm_write("duty_cycle", "0")
+            self._pwm_write("enable", "0")
+        elif self._mode == "gpio":
+            self._gpio_set(0)
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +296,8 @@ class ButtonListener:
     EVENT_SIZE = struct.calcsize("llHHI")
 
     def __init__(self, callback_map):
-        """callback_map: {linux_keycode: callable}"""
+        """callback_map: {linux_keycode: callable(value)}
+        value: 1=pressed/switch-on, 0=released/switch-off"""
         self.callback_map = callback_map
         self._fds = {}
         self._thread = None
@@ -180,10 +345,10 @@ class ButtonListener:
                     if len(data) < self.EVENT_SIZE:
                         continue
                     _, _, ev_type, code, value = struct.unpack("llHHI", data)
-                    if ev_type == self.EV_KEY and value == 1:
+                    if ev_type == self.EV_KEY:
                         cb = self.callback_map.get(code)
                         if cb:
-                            cb()
+                            cb(value)
             except Exception:
                 pass
 
@@ -199,27 +364,90 @@ class ButtonListener:
 # ---------------------------------------------------------------------------
 #  Hardware abstraction: Audio playback via ALSA aplay
 # ---------------------------------------------------------------------------
+_SDMODE_GPIO = 131          # GPIO4_A3 -> BSS138 gate -> MAX98357A SD_MODE
+
+SPEAKER_CARD = "SmartEyeAudio"
+SPEAKER_DEV  = "smarteye_loud"
+
+def _sysfs_gpio_export(gpio):
+    """Export a GPIO via sysfs if not already exported."""
+    path = f"/sys/class/gpio/gpio{gpio}"
+    if not os.path.isdir(path):
+        try:
+            with open("/sys/class/gpio/export", "w") as f:
+                f.write(str(gpio))
+            time.sleep(0.05)
+        except OSError:
+            return False
+    try:
+        with open(f"{path}/direction", "w") as f:
+            f.write("out")
+    except OSError:
+        return False
+    return True
+
+def _sysfs_gpio_set(gpio, value):
+    """Set a GPIO value (0 or 1) via sysfs."""
+    try:
+        with open(f"/sys/class/gpio/gpio{gpio}/value", "w") as f:
+            f.write(str(value))
+    except OSError:
+        pass
+
+
 class AudioPlayer:
-    """Non-blocking WAV playback through ALSA Smart-Eye-Audio card."""
+    """Audio playback via MAX98357A speaker amplifier.
+
+    BSS138 inverted logic for SD_MODE:
+      AMP_SD HIGH -> Q1 ON  -> SD_MODE LOW  -> amp OFF
+      AMP_SD LOW  -> Q1 OFF -> pullup -> SD_MODE HIGH -> amp ON
+    """
 
     def __init__(self):
-        self.card = self._find_card()
         self._lock = threading.Lock()
         self._proc = None
+        self._sd_gpio_ok = self._init_sdmode()
+        self._spk_card = self._find_card(SPEAKER_CARD)
+        self._init_softvol()
         self._queue = queue.Queue()
         self._thread = threading.Thread(target=self._worker, daemon=True)
         self._thread.start()
+        log.info("Audio: speaker=card%s", self._spk_card)
 
-    def _find_card(self):
+    def _init_sdmode(self):
+        """Export AMP_SD GPIO; set HIGH at init (amp OFF)."""
+        ok = _sysfs_gpio_export(_SDMODE_GPIO)
+        if ok:
+            _sysfs_gpio_set(_SDMODE_GPIO, 1)
+            log.info("AMP_SD (gpio%d) HIGH — speaker amp OFF", _SDMODE_GPIO)
+        else:
+            log.warning("Could not export AMP_SD gpio%d", _SDMODE_GPIO)
+        return ok
+
+    def _init_softvol(self):
+        """Set the speaker softvol to 100%."""
+        try:
+            subprocess.run(
+                ["amixer", "-c", SPEAKER_CARD, "sset", "SoftMaster", "100%"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
+            )
+        except Exception:
+            pass
+
+    @staticmethod
+    def _find_card(name):
         try:
             with open("/proc/asound/cards") as f:
                 for line in f:
-                    if "SmartEyeAudio" in line:
+                    if name in line:
                         return int(line.strip().split()[0])
         except Exception:
             pass
-        log.warning("Smart-Eye-Audio card not found, falling back to default")
         return None
+
+    @property
+    def _active_dev(self):
+        return SPEAKER_DEV if self._spk_card is not None else "default"
 
     def play(self, wav_path):
         if os.path.isfile(wav_path):
@@ -233,22 +461,29 @@ class AudioPlayer:
             self._play_sync(path)
 
     def _play_sync(self, path):
-        dev = f"plughw:{self.card},0" if self.card is not None else "default"
+        dev = self._active_dev
         try:
+            if self._sd_gpio_ok:
+                _sysfs_gpio_set(_SDMODE_GPIO, 0)   # AMP_SD LOW -> amp ON
+                time.sleep(0.01)
             self._proc = subprocess.Popen(
                 ["aplay", "-D", dev, "-q", path],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
             self._proc.wait(timeout=15)
         except Exception as e:
-            log.warning("Audio playback error: %s", e)
+            log.warning("Audio playback error (%s): %s", dev, e)
         finally:
+            if self._sd_gpio_ok:
+                _sysfs_gpio_set(_SDMODE_GPIO, 1)   # AMP_SD HIGH -> amp OFF
             self._proc = None
 
     def stop(self):
         self._queue.put(None)
         if self._proc:
             self._proc.terminate()
+        if self._sd_gpio_ok:
+            _sysfs_gpio_set(_SDMODE_GPIO, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -257,12 +492,39 @@ class AudioPlayer:
 I2C_SLAVE = 0x0703
 
 class BatteryGauge:
-    """Read battery status from BQ27220 fuel gauge via /dev/i2c-3."""
+    """Read battery status from BQ27220 fuel gauge via /dev/i2c-3.
+
+    BQ27220 register map (TI SLUSE14):
+      0x06 Temperature       (0.1 K)
+      0x08 Voltage           (mV)
+      0x10 RemainingCapacity (mAh)
+      0x12 FullChargeCapacity(mAh)
+      0x14 AverageCurrent    (mA, signed)
+      0x16 TimeToEmpty       (minutes, 0xFFFF = charging/not discharging)
+      0x22 AveragePower      (cW, signed)
+      0x2C StateOfCharge     (%)   -- NOTE: NOT 0x28 on BQ27220
+
+    The gauge's internal DesignCapacity/FCC registers may not match the
+    actual battery (requires sealed-mode programming).  We use the known
+    DESIGN_CAPACITY_MAH for runtime estimation instead.
+    """
+
+    DESIGN_CAPACITY_MAH = 10000
+
+    REG_TEMP     = 0x06
+    REG_VOLTAGE  = 0x08
+    REG_REM_CAP  = 0x10
+    REG_FCC      = 0x12
+    REG_AVG_CUR  = 0x14
+    REG_TTE      = 0x16
+    REG_AVG_PWR  = 0x22
+    REG_SOC      = 0x2C
 
     def __init__(self, bus=3, addr=0x55):
         self.bus = bus
         self.addr = addr
         self.fd = None
+        self._lock = threading.Lock()
         try:
             self.fd = os.open(f"/dev/i2c-{bus}", os.O_RDWR)
             fcntl.ioctl(self.fd, I2C_SLAVE, addr)
@@ -272,8 +534,9 @@ class BatteryGauge:
     def _rw(self, reg):
         if self.fd is None:
             return 0
-        os.write(self.fd, bytes([reg]))
-        d = os.read(self.fd, 2)
+        with self._lock:
+            os.write(self.fd, bytes([reg]))
+            d = os.read(self.fd, 2)
         return d[0] | (d[1] << 8)
 
     def _rw_signed(self, reg):
@@ -282,19 +545,60 @@ class BatteryGauge:
 
     @property
     def voltage_mv(self):
-        return self._rw(0x08)
+        return self._rw(self.REG_VOLTAGE)
 
     @property
     def soc(self):
-        return self._rw(0x2C)
+        return self._rw(self.REG_SOC)
 
     @property
     def current_ma(self):
-        return self._rw_signed(0x14)
+        return self._rw_signed(self.REG_AVG_CUR)
+
+    @property
+    def remaining_mah(self):
+        """Estimated remaining capacity based on SOC and known design capacity."""
+        return int(self.soc * self.DESIGN_CAPACITY_MAH / 100)
+
+    @property
+    def full_charge_mah(self):
+        return self.DESIGN_CAPACITY_MAH
+
+    @property
+    def avg_power_mw(self):
+        return self._rw_signed(self.REG_AVG_PWR) * 10
+
+    @property
+    def time_to_empty_min(self):
+        """Compute TTE from remaining capacity and average current draw."""
+        cur = self.current_ma
+        if cur >= 0:
+            return None
+        rem = self.remaining_mah
+        return int(rem / abs(cur) * 60) if cur != 0 else None
 
     @property
     def temperature_c(self):
-        return self._rw(0x06) / 10.0 - 273.15
+        return self._rw(self.REG_TEMP) * 0.1 - 273.15
+
+    def snapshot(self):
+        """Return a dict of all key battery parameters in one call."""
+        soc = self.soc
+        vmv = self.voltage_mv
+        cur = self.current_ma
+        rem = int(soc * self.DESIGN_CAPACITY_MAH / 100)
+        tte = int(rem / abs(cur) * 60) if cur < 0 else None
+        power_mw = int(vmv * abs(cur) / 1000)
+        return {
+            "soc": soc,
+            "voltage_mv": vmv,
+            "current_ma": cur,
+            "remaining_mah": rem,
+            "full_charge_mah": self.DESIGN_CAPACITY_MAH,
+            "avg_power_mw": power_mw,
+            "tte_min": tte,
+            "temp_c": self.temperature_c,
+        }
 
     def close(self):
         if self.fd is not None:
@@ -306,14 +610,15 @@ class BatteryGauge:
 #  Hardware abstraction: Ultrasonic sensor via UART6
 # ---------------------------------------------------------------------------
 class UltrasonicSensor:
-    """JSN-SR04T ultrasonic sensor on UART6 (/dev/ttyS6).
+    """AJ-SR04M ultrasonic sensor on UART (Mode 4: serial trigger/response).
 
     Protocol: send 0x01, receive 0xFF H_DATA L_DATA SUM.
     Distance = (H_DATA<<8 | L_DATA) in mm.
     """
 
-    def __init__(self, device="/dev/ttyS6", baudrate=9600):
+    def __init__(self, device="/dev/ttyS6", baudrate=9600, label="ultrasonic"):
         import serial
+        self.label = label
         try:
             self.ser = serial.Serial(
                 port=device, baudrate=baudrate,
@@ -321,9 +626,9 @@ class UltrasonicSensor:
                 stopbits=serial.STOPBITS_ONE, timeout=1.0,
             )
             self.ser.reset_input_buffer()
-            log.info("Ultrasonic sensor on %s @ %d baud", device, baudrate)
+            log.info("%s sensor on %s @ %d baud", label, device, baudrate)
         except Exception as e:
-            log.warning("Ultrasonic sensor init failed: %s", e)
+            log.warning("%s sensor init failed (%s): %s", label, device, e)
             self.ser = None
 
     def measure_mm(self):
@@ -387,6 +692,7 @@ class CameraDetector:
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.cap.set(cv2.CAP_PROP_FPS, 10)
         w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         log.info("Camera %s opened at %dx%d", self.device, w, h)
@@ -438,30 +744,31 @@ class CameraDetector:
 #  OCR
 # ---------------------------------------------------------------------------
 class OCREngine:
-    """PaddleOCR wrapper."""
+    """RapidOCR wrapper (onnxruntime backend, no paddlepaddle dependency).
+
+    Uses a single RapidOCR instance for all languages -- the ONNX models
+    handle multilingual text (Latin + Devanagari) natively.
+    """
 
     def __init__(self):
-        from paddleocr import PaddleOCR
-        self.ocr_en = PaddleOCR(use_angle_cls=True, lang="en", show_log=False)
-        self.ocr_hi = None  # lazy-loaded
+        self._ocr = None
 
-    def _get_hi(self):
-        if self.ocr_hi is None:
-            from paddleocr import PaddleOCR
-            self.ocr_hi = PaddleOCR(use_angle_cls=True, lang="hi", show_log=False)
-        return self.ocr_hi
+    def _get_ocr(self):
+        if self._ocr is None:
+            from rapidocr_onnxruntime import RapidOCR
+            self._ocr = RapidOCR()
+            log.info("RapidOCR (onnxruntime) initialized")
+        return self._ocr
 
     def recognize(self, frame, lang="en", scale=2.0):
         h, w = frame.shape[:2]
         upscaled = cv2.resize(frame, (int(w * scale), int(h * scale)),
                               interpolation=cv2.INTER_CUBIC)
-        engine = self.ocr_en if lang == "en" else self._get_hi()
-        result = engine.ocr(upscaled, cls=True)
+        ocr = self._get_ocr()
+        result, _ = ocr(upscaled)
         texts = []
-        if result and result[0]:
-            for line in result[0]:
-                txt = line[1][0]
-                conf = line[1][1]
+        if result:
+            for box, txt, conf in result:
                 if conf > 0.5:
                     texts.append(txt)
         return " ".join(texts) if texts else None
@@ -553,11 +860,14 @@ AUDIO_FILES = {
 #  Application
 # ---------------------------------------------------------------------------
 class SmartEyeApp:
-    ULTRASONIC_THRESHOLD_CM = 155
-    HANGING_THRESHOLD_CM = 90
+    US_FRONT_THRESHOLD_CM = 180
+    US_DOWN_THRESHOLD_CM = 135
     ANNOUNCE_COOLDOWN = 2.0
     OCR_COOLDOWN = 3.0
     BATTERY_INTERVAL = 30.0
+    DETECTION_FPS = 5             # target detection frame rate (saves ~70% CPU vs unlimited)
+    ULTRASONIC_INTERVAL = 0.5     # check ultrasonic every 500ms, not every frame
+    GC_INTERVAL = 10.0            # gc.collect every 10s instead of every frame
 
     SOC_WARN = 20
     SOC_SHUTDOWN = 10
@@ -568,14 +878,19 @@ class SmartEyeApp:
         self._running = True
         self._last_announce = 0
         self._last_ocr = 0
+        self._last_ultrasonic = 0
+        self._last_gc = 0
         self._battery_warned = False
 
         log.info("Initializing Smart Eye system...")
 
+        _apply_power_profile()
+
         self.vibrator = VibrationMotor()
         self.audio = AudioPlayer()
         self.gauge = BatteryGauge()
-        self.ultrasonic = UltrasonicSensor()
+        self.us_front = UltrasonicSensor("/dev/ttyS2", label="US-front")
+        self.us_down  = UltrasonicSensor("/dev/ttyS6", label="US-down")
         self.ocr = OCREngine()
         self.translator = Translator()
 
@@ -587,8 +902,8 @@ class SmartEyeApp:
         )
 
         self.buttons = ButtonListener({
-            0x100: self._on_lang_btn,   # BTN_MISC  -> language toggle
-            0x101: self._on_ocr_btn,    # BTN_1     -> OCR trigger
+            0x100: self._on_lang_event,
+            0x101: self._on_ocr_btn,
         })
         self.buttons.start()
 
@@ -613,14 +928,21 @@ class SmartEyeApp:
         if p:
             self.audio.play(p)
 
-    # --- Button callbacks ---
-    def _on_lang_btn(self):
-        self.lang = "hi" if self.lang == "en" else "en"
-        log.info("Language switched to %s", self.lang)
-        self.vibrator.buzz(100)
-        self._play("lang_toggle")
+    # --- Language slide switch (LANG_BTN GPIO0_D0, active-low) ---
+    # gpio-keys sends EV_KEY with BTN_MISC (0x100):
+    #   value=1 -> switch active (GPIO low)  -> English
+    #   value=0 -> switch released (GPIO high) -> Hindi
+    def _on_lang_event(self, value):
+        new_lang = "en" if value == 1 else "hi"
+        if new_lang != self.lang:
+            self.lang = new_lang
+            log.info("Language switched to %s (switch=%d)", self.lang, value)
+            self.vibrator.buzz(100)
+            self._play("lang_toggle")
 
-    def _on_ocr_btn(self):
+    def _on_ocr_btn(self, value):
+        if value != 1:
+            return
         now = time.time()
         if now - self._last_ocr < self.OCR_COOLDOWN:
             return
@@ -635,28 +957,55 @@ class SmartEyeApp:
         if frame is None:
             return
         text = self.ocr.recognize(frame, lang=self.lang)
-        if text:
-            log.info("OCR result: %s", text[:100])
-            self._tts_speak(text)
-        else:
+        if not text:
             self._play("no_text")
+            return
 
-    def _tts_speak(self, text):
+        log.info("OCR result: %s", text[:100])
+
+        if self.lang == "hi":
+            translated = self.translator.translate(text, "en", "hi")
+            log.info("Translated to Hindi: %s", translated[:100])
+            self._tts_speak(translated, force_lang="hi")
+        else:
+            self._tts_speak(text, force_lang="en")
+
+    def _tts_speak(self, text, force_lang=None):
+        wav_out = "/tmp/smart_eye_tts.wav"
+        lang = force_lang or self.lang
+        safe_text = text.replace('"', '\\"').replace("'", "\\'")
+
         try:
-            wav_out = "/tmp/smart_eye_tts.wav"
             piper_bin = os.path.join(PROJECT_ROOT, "piper/piper/piper")
-            model = os.path.join(PROJECT_ROOT,
-                                 "piper/en_US-amy-medium.onnx" if self.lang == "en"
-                                 else "piper/hi_IN-pratham-medium.onnx")
+            piper_models = {
+                "en": os.path.join(PROJECT_ROOT, "piper/en_US-amy-medium.onnx"),
+                "hi": os.path.join(PROJECT_ROOT, "piper/hi_IN-pratham-medium.onnx"),
+            }
+            model = piper_models.get(lang, piper_models["en"])
+
             if os.path.isfile(piper_bin) and os.path.isfile(model):
                 subprocess.run(
-                    f'echo "{text}" | "{piper_bin}" --model "{model}" --output_file "{wav_out}"',
-                    shell=True, timeout=10,
+                    f'echo "{safe_text}" | "{piper_bin}" --model "{model}" '
+                    f'--output_file "{wav_out}"',
+                    shell=True, timeout=20,
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 )
                 self.audio.play(wav_out)
-            else:
-                log.info("Piper TTS not available, skipping speech")
+                return
+
+            espeak = "/usr/bin/espeak-ng"
+            if not os.path.isfile(espeak):
+                espeak = "/usr/bin/espeak"
+            if os.path.isfile(espeak):
+                subprocess.run(
+                    [espeak, "-v", lang, "-w", wav_out, safe_text],
+                    timeout=10,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                self.audio.play(wav_out)
+                return
+
+            log.info("No TTS engine available (install espeak-ng: sudo apt install espeak-ng)")
         except Exception as e:
             log.warning("TTS error: %s", e)
 
@@ -664,10 +1013,15 @@ class SmartEyeApp:
     def _battery_loop(self):
         while self._running:
             try:
-                soc = self.gauge.soc
-                v = self.gauge.voltage_mv
-                cur = self.gauge.current_ma
-                log.info("Battery: %d%% %dmV %dmA", soc, v, cur)
+                b = self.gauge.snapshot()
+                soc = b["soc"]
+                tte = b["tte_min"]
+                tte_str = f"{tte}min ({tte / 60:.1f}h)" if tte else "charging/N/A"
+                log.info(
+                    "Battery: %d%% %dmV %dmA %dmW rem=%dmAh TTE=%s T=%.0fC",
+                    soc, b["voltage_mv"], b["current_ma"],
+                    b["avg_power_mw"], b["remaining_mah"], tte_str, b["temp_c"],
+                )
 
                 if soc <= self.SOC_SHUTDOWN and not self._battery_warned:
                     self._play("battery_shutdown")
@@ -706,25 +1060,46 @@ class SmartEyeApp:
         log.info("  Camera:      %s", self.args.camera)
         log.info("  Threshold:   %.2f", self.args.threshold)
         log.info("  Language:    %s", self.lang)
+        log.info("  Target FPS:  %d", self.DETECTION_FPS)
+
+        frame_interval = 1.0 / self.DETECTION_FPS
 
         try:
             while self._running:
+                t_start = time.monotonic()
+
                 frame = self.detector.grab_frame()
                 if frame is None:
-                    time.sleep(0.01)
+                    time.sleep(0.05)
                     continue
 
                 detections = self.detector.detect(frame)
                 for det in detections:
                     self._announce(det["label"])
 
-                dist = self.ultrasonic.measure_cm()
-                if dist is not None:
-                    if dist < self.HANGING_THRESHOLD_CM:
-                        log.info("Ultrasonic obstacle: %.0f cm", dist)
+                now = time.monotonic()
+                if now - self._last_ultrasonic >= self.ULTRASONIC_INTERVAL:
+                    self._last_ultrasonic = now
+                    d_front = self.us_front.measure_cm()
+                    time.sleep(0.05)
+                    d_down  = self.us_down.measure_cm()
+
+                    if d_front is not None and d_front < self.US_FRONT_THRESHOLD_CM:
+                        log.info("US-front obstacle: %.0f cm", d_front)
                         self.vibrator.buzz(300, 80)
 
-                gc.collect()
+                    if d_down is not None and d_down < self.US_DOWN_THRESHOLD_CM:
+                        log.info("US-down obstacle: %.0f cm", d_down)
+                        self.vibrator.pulse(2, 150, 100, 60)
+
+                if now - self._last_gc >= self.GC_INTERVAL:
+                    self._last_gc = now
+                    gc.collect()
+
+                elapsed = time.monotonic() - t_start
+                sleep_time = frame_interval - elapsed
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
 
         except KeyboardInterrupt:
             log.info("Shutting down...")
@@ -737,7 +1112,8 @@ class SmartEyeApp:
         self.buttons.stop()
         self.audio.stop()
         self.detector.close()
-        self.ultrasonic.close()
+        self.us_front.close()
+        self.us_down.close()
         self.gauge.close()
         log.info("Cleanup complete.")
 
@@ -755,10 +1131,14 @@ def parse_args():
                    help="Detection confidence threshold")
     p.add_argument("--labels", default=None,
                    help="Path to custom class labels file (one per line)")
+    p.add_argument("--fps", type=int, default=5,
+                   help="Target detection FPS (lower = less power, default 5)")
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
     app = SmartEyeApp(args)
+    if hasattr(args, "fps"):
+        app.DETECTION_FPS = args.fps
     app.run()

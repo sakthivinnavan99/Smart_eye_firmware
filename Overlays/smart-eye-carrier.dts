@@ -1,0 +1,249 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+	metadata {
+		title = "Smart Eye Custom Carrier Board";
+		compatible = "radxa,cm5-io";
+		category = "misc";
+		exclusive = "GPIO4_B3\0GPIO3_B7\0GPIO3_C0\0GPIO4_A4\0GPIO1_D1\0GPIO1_D0\0GPIO0_D3\0GPIO0_D0\0GPIO0_C7\0GPIO4_A3\0GPIO4_A1\0GPIO4_A2\0GPIO4_B2\0GPIO0_B5\0GPIO0_B6";
+		description = "Enable peripherals for Smart Eye custom carrier board:\n  - PWM15-M1 (GPIO4_B3) vibration motor\n  - I2C3-M1 (GPIO3_B7 SCL / GPIO3_C0 SDA) BQ27220 fuel gauge + BQ25895 charger\n  - GPIO4_A4 fuel gauge GPOUT interrupt\n  - UART6-M2 (GPIO1_D1 TX / GPIO1_D0 RX) ultrasonic sensor 1\n  - UART2-M0 (GPIO0_B5 TX / GPIO0_B6 RX) ultrasonic sensor 2\n  - GPIO0_D3 CHG_INT0_L charger interrupt\n  - GPIO0_D0 LANG_BTN, GPIO0_C7 OCR_BTN\n  - Speaker: MAX98357A on I2S1-M0 (SD_MODE via BSS138 on GPIO4_A3)\n  - I2S1 trcm-sync-tx-only: BCLK+LRCLK stop together (DC protection)";
+	};
+
+	/*
+	 * Vibration motor on GPIO4_B3.
+	 *
+	 * In the Radxa BSP DTS the PWM controller at 0xfebd0030 is
+	 * labeled "pwm7", NOT "pwm15". The "pwm15" symbol points to
+	 * 0xfebf0030 which is a completely different PWM block.
+	 * GPIO4_B3 muxes to the controller at febd0030, so we must
+	 * target &pwm7 with &pwm7m1_pins.
+	 */
+	fragment@0 {
+		target = <&pwm7>;
+		__overlay__ {
+			status = "okay";
+			pinctrl-names = "default";
+			pinctrl-0 = <&pwm7m1_pins>;
+		};
+	};
+
+	/*
+	 * I2C3-M1: Power management ICs on GPIO3_B7 (SCL) / GPIO3_C0 (SDA)
+	 *   0x55 - BQ27220YZFR  fuel gauge (U20)
+	 *   0x6A - BQ25895RTWR  charger    (U2)
+	 */
+	fragment@1 {
+		target = <&i2c3>;
+		__overlay__ {
+			status = "okay";
+			pinctrl-names = "default";
+			pinctrl-0 = <&i2c3m1_xfer>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			bq27220: fuel-gauge@55 {
+				compatible = "ti,bq27220";
+				reg = <0x55>;
+				pinctrl-names = "default";
+				pinctrl-0 = <&bq27220_int>;
+				interrupt-parent = <&gpio4>;
+				interrupts = <4 2>; /* GPIO4_A4, IRQ_TYPE_EDGE_FALLING */
+			};
+
+			bq25895: charger@6a {
+				compatible = "ti,bq25895";
+				reg = <0x6a>;
+				pinctrl-names = "default";
+				pinctrl-0 = <&chg_int0>;
+				interrupt-parent = <&gpio0>;
+				interrupts = <27 2>; /* GPIO0_D3, IRQ_TYPE_EDGE_FALLING */
+				ti,battery-regulation-voltage = <4208000>; /* uV */
+				ti,charge-current = <2048000>;             /* uA */
+				ti,termination-current = <256000>;         /* uA */
+				ti,precharge-current = <256000>;           /* uA */
+				ti,minimum-sys-voltage = <3500000>;        /* uV */
+				ti,boost-voltage = <5126000>;              /* uV */
+				ti,boost-max-current = <1400000>;          /* uA */
+			};
+		};
+	};
+
+	/* GPIO pin configurations for interrupts, buttons, and audio */
+	fragment@2 {
+		target = <&pinctrl>;
+		__overlay__ {
+			bq27220 {
+				bq27220_int: bq27220-int {
+					rockchip,pins = <4 4 0 &pcfg_pull_up>;
+				};
+			};
+			charger {
+				chg_int0: chg-int0 {
+					rockchip,pins = <0 27 0 &pcfg_pull_up>;
+				};
+			};
+			buttons {
+				lang_btn: lang-btn {
+					rockchip,pins = <0 24 0 &pcfg_pull_up>;
+				};
+				ocr_btn: ocr-btn {
+					rockchip,pins = <0 23 0 &pcfg_pull_up>;
+				};
+			};
+			audio-amp {
+				amp_sd_pin: amp-sd-pin {
+					rockchip,pins = <4 3 0 &pcfg_pull_none>;
+				};
+			};
+		};
+	};
+
+	/* UART6-M2: Serial port on GPIO1_D1 (TX) / GPIO1_D0 (RX) */
+	fragment@3 {
+		target = <&uart6>;
+		__overlay__ {
+			status = "okay";
+			pinctrl-names = "default";
+			pinctrl-0 = <&uart6m2_xfer>;
+		};
+	};
+
+	/* GPIO keys: LANG_BTN (GPIO0_D0) and OCR_BTN (GPIO0_C7) */
+	fragment@4 {
+		target-path = "/";
+		__overlay__ {
+			smart-eye-keys {
+				compatible = "gpio-keys";
+				pinctrl-names = "default";
+				pinctrl-0 = <&lang_btn &ocr_btn>;
+
+				lang-button {
+					label = "LANG_BTN";
+					linux,code = <0x100>; /* BTN_MISC */
+					gpios = <&gpio0 24 1>; /* GPIO0_D0, active low */
+					debounce-interval = <50>;
+				};
+
+				ocr-button {
+					label = "OCR_BTN";
+					linux,code = <0x101>; /* BTN_1 */
+					gpios = <&gpio0 23 1>; /* GPIO0_C7, active low */
+					debounce-interval = <50>;
+				};
+			};
+
+			/*
+			 * MAX98357A speaker amplifier (I2S DAC, no I2C).
+			 *
+			 * SD_MODE is NOT managed by the kernel driver here.
+			 * The kernel's DAPM shutdown path leaves I2S BCLK
+			 * running for ~3 s after the PCM stream closes,
+			 * creating the dangerous BCLK-without-LRCLK state
+			 * that produces DC on the speaker outputs.
+			 *
+			 * Instead, the application (main.py AudioPlayer)
+			 * controls GPIO4_A3 via sysfs, pulling SD_MODE LOW
+			 * the instant aplay exits — before the I2S clocks
+			 * enter the invalid state.
+			 */
+			max98357a: max98357a {
+				compatible = "maxim,max98357a";
+				#sound-dai-cells = <0>;
+				pinctrl-names = "default";
+				pinctrl-0 = <&amp_sd_pin>;
+				status = "okay";
+			};
+		};
+	};
+
+	/*
+	 * ES8316 codec is NOT populated on this carrier board revision.
+	 * Explicitly disable the es8316-sound card and I2S0 controller
+	 * that the CM5-IO base DTB enables by default.
+	 */
+	fragment@5 {
+		target-path = "/es8316-sound";
+		__overlay__ {
+			status = "disabled";
+		};
+	};
+
+	fragment@5a {
+		target = <&i2s0_8ch>;
+		__overlay__ {
+			status = "disabled";
+		};
+	};
+
+	/*
+	 * UART2-M0: Second ultrasonic sensor on GPIO0_B5 (TX) / GPIO0_B6 (RX)
+	 * Connected via J8 connector with 100R series resistors and ESD protection.
+	 * The base DTB already enables UART2 with uart2m0 pinmux, but we
+	 * explicitly set it here to ensure the mux is correct.
+	 */
+	fragment@5b {
+		target = <&uart2>;
+		__overlay__ {
+			status = "okay";
+			pinctrl-names = "default";
+			pinctrl-0 = <&uart2m0_xfer>;
+		};
+	};
+
+	/*
+	 * Enable I2S1 (fe480000) with m0 pinctrl.
+	 * SDO1 (GPIO4_B2) carries audio data to MAX98357A DIN via R43.
+	 * i2s-tx-route swaps SDO0/SDO1 so stereo data goes out SDO1.
+	 *
+	 * Delete i2s-lrck-gpio from base DTB -- the BSP driver uses it
+	 * to monitor LRCK via GPIO, which conflicts with driving LRCK
+	 * as I2S output in CPU-master mode.
+	 *
+	 * rockchip,trcm-sync-tx-only forces the I2S controller to stop
+	 * both BCLK and LRCK simultaneously when TX stops, preventing
+	 * the dangerous state where BCLK free-runs after LRCLK drops.
+	 */
+	fragment@6 {
+		target = <&i2s1_8ch>;
+		__overlay__ {
+			status = "okay";
+			/delete-property/ i2s-lrck-gpio;
+			rockchip,i2s-tx-route = <1 0 2 3>;
+			rockchip,i2s-rx-route = <0 1 2 3>;
+			rockchip,trcm-sync-tx-only;
+			pinctrl-names = "default";
+			pinctrl-0 = <&i2s1m0_sclk
+				     &i2s1m0_lrck
+				     &i2s1m0_sdi0
+				     &i2s1m0_sdo1>;
+		};
+	};
+
+	/*
+	 * Speaker sound card via MAX98357A on I2S1.
+	 * CPU (I2S1) is bitclock + frame master.
+	 */
+	fragment@7 {
+		target-path = "/";
+		__overlay__ {
+			smart-eye-sound {
+				status = "okay";
+				compatible = "simple-audio-card";
+				simple-audio-card,name = "Smart-Eye-Audio";
+				simple-audio-card,format = "i2s";
+				simple-audio-card,mclk-fs = <256>;
+				simple-audio-card,bitclock-master = <&spk_cpu>;
+				simple-audio-card,frame-master = <&spk_cpu>;
+
+				spk_cpu: simple-audio-card,cpu {
+					sound-dai = <&i2s1_8ch>;
+				};
+
+				simple-audio-card,codec {
+					sound-dai = <&max98357a>;
+				};
+			};
+		};
+	};
+};

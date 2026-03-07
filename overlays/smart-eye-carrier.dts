@@ -7,7 +7,7 @@
 		compatible = "radxa,cm5-io";
 		category = "misc";
 		exclusive = "GPIO4_B3\0GPIO3_B7\0GPIO3_C0\0GPIO4_A4\0GPIO1_D1\0GPIO1_D0\0GPIO0_D3\0GPIO0_D0\0GPIO0_C7\0GPIO4_A3\0GPIO4_A1\0GPIO4_A2\0GPIO4_B2";
-		description = "Enable peripherals for Smart Eye custom carrier board:\n  - PWM15-M1 (GPIO4_B3) vibration motor\n  - I2C3-M1 (GPIO3_B7 SCL / GPIO3_C0 SDA) BQ27220 fuel gauge + BQ25895 charger\n  - GPIO4_A4 fuel gauge GPOUT interrupt\n  - UART6-M2 (GPIO1_D1 TX / GPIO1_D0 RX) serial\n  - GPIO0_D3 CHG_INT0_L charger interrupt\n  - GPIO0_D0 LANG_BTN, GPIO0_C7 OCR_BTN\n  - Audio: MAX98357A speaker on I2S1-M0 (SCLK=GPIO4_A1, LRCK=GPIO4_A2, SDO1=GPIO4_B2)\n  - GPIO4_A3 speaker amp SD_MODE (external BSS138/BAT54 circuit)";
+		description = "Enable peripherals for Smart Eye custom carrier board:\n  - PWM15-M1 (GPIO4_B3) vibration motor\n  - I2C3-M1 (GPIO3_B7 SCL / GPIO3_C0 SDA) BQ27220 fuel gauge + BQ25895 charger\n  - GPIO4_A4 fuel gauge GPOUT interrupt\n  - UART6-M2 (GPIO1_D1 TX / GPIO1_D0 RX) serial\n  - GPIO0_D3 CHG_INT0_L charger interrupt\n  - GPIO0_D0 LANG_BTN, GPIO0_C7 OCR_BTN\n  - Speaker: MAX98357A on I2S1-M0 (SD_MODE via BSS138 on GPIO4_A3)\n  - Headphone: ES8316 codec on I2S0 + I2C8-M2 (hp-det-gpio jack detect)\n  - I2S1 trcm-sync-tx-only: BCLK+LRCLK stop together (DC protection)";
 	};
 
 	/*
@@ -135,33 +135,48 @@
 
 			/*
 			 * MAX98357A speaker amplifier (I2S DAC, no I2C).
-			 * SD_MODE is controlled by the external BSS138/BAT54
-			 * circuit (HP_INT based), matching the prototype config.
+			 *
+			 * SD_MODE is NOT managed by the kernel driver here.
+			 * The kernel's DAPM shutdown path leaves I2S BCLK
+			 * running for ~3 s after the PCM stream closes,
+			 * creating the dangerous BCLK-without-LRCLK state
+			 * that produces DC on the speaker outputs.
+			 *
+			 * Instead, the application (main.py AudioPlayer)
+			 * controls GPIO4_A3 via sysfs, pulling SD_MODE LOW
+			 * the instant aplay exits — before the I2S clocks
+			 * enter the invalid state.
 			 */
 			max98357a: max98357a {
 				compatible = "maxim,max98357a";
 				#sound-dai-cells = <0>;
+				pinctrl-names = "default";
+				pinctrl-0 = <&amp_sd_pin>;
 				status = "okay";
 			};
 		};
 	};
 
 	/*
-	 * Disable the CM5-IO es8316-sound card and I2S0 controller.
-	 * I2S0 must be disabled so it doesn't drive BCLK/LRCK/SDO0
-	 * which share the same traces as I2S1 via resistor selection.
+	 * Re-enable the CM5-IO es8316-sound card and I2S0 controller.
+	 * ES8316 codec on I2C8-M2 (0x11) provides headphone output
+	 * via I2S0.  I2S0 has its own pins (separate from I2S1 which
+	 * drives the MAX98357A speaker).  Both can coexist.
+	 *
+	 * The base DTB es8316-sound node already has hp-det-gpio
+	 * for jack detection.  We just ensure both are enabled.
 	 */
 	fragment@5 {
 		target-path = "/es8316-sound";
 		__overlay__ {
-			status = "disabled";
+			status = "okay";
 		};
 	};
 
 	fragment@5a {
 		target = <&i2s0_8ch>;
 		__overlay__ {
-			status = "disabled";
+			status = "okay";
 		};
 	};
 
@@ -169,11 +184,14 @@
 	 * Enable I2S1 (fe480000) with m0 pinctrl.
 	 * SDO1 (GPIO4_B2) carries audio data to MAX98357A DIN via R43.
 	 * i2s-tx-route swaps SDO0/SDO1 so stereo data goes out SDO1.
-	 * Config matches the tested prototype (cm5-max98357a.dts).
 	 *
 	 * Delete i2s-lrck-gpio from base DTB -- the BSP driver uses it
 	 * to monitor LRCK via GPIO, which conflicts with driving LRCK
 	 * as I2S output in CPU-master mode.
+	 *
+	 * rockchip,trcm-sync-tx-only forces the I2S controller to stop
+	 * both BCLK and LRCK simultaneously when TX stops, preventing
+	 * the dangerous state where BCLK free-runs after LRCLK drops.
 	 */
 	fragment@6 {
 		target = <&i2s1_8ch>;
@@ -182,6 +200,7 @@
 			/delete-property/ i2s-lrck-gpio;
 			rockchip,i2s-tx-route = <1 0 2 3>;
 			rockchip,i2s-rx-route = <0 1 2 3>;
+			rockchip,trcm-sync-tx-only;
 			pinctrl-names = "default";
 			pinctrl-0 = <&i2s1m0_sclk
 				     &i2s1m0_lrck
