@@ -665,6 +665,10 @@ class UltrasonicSensor:
     def __init__(self, device="/dev/ttyS6", baudrate=9600, label="ultrasonic"):
         import serial
         self.label = label
+        if not device or str(device).lower() in ("none", "off", "disabled"):
+            self.ser = None
+            log.info("%s sensor disabled (no device)", label)
+            return
         try:
             self.ser = serial.Serial(
                 port=device, baudrate=baudrate,
@@ -675,6 +679,8 @@ class UltrasonicSensor:
             log.info("%s sensor on %s @ %d baud", label, device, baudrate)
         except Exception as e:
             log.warning("%s sensor init failed (%s): %s", label, device, e)
+            if "No such file or directory" in str(e) and "ttyS" in device:
+                log.info("If only /dev/ttyS6 exists, run with --us-front-device /dev/ttyS6 for one sensor, or enable UART2 in device tree for two.")
             self.ser = None
 
     def measure_mm(self):
@@ -964,8 +970,12 @@ class SmartEyeApp:
         self.vibrator = VibrationMotor()
         self.audio = AudioPlayer()
         self.gauge = BatteryGauge()
-        self.us_front = UltrasonicSensor("/dev/ttyS2", label="US-front")
-        self.us_down  = UltrasonicSensor("/dev/ttyS6", label="US-down")
+        self.us_front = UltrasonicSensor(
+            getattr(self.args, "us_front_device", "/dev/ttyS2"), label="US-front"
+        )
+        self.us_down = UltrasonicSensor(
+            getattr(self.args, "us_down_device", "/dev/ttyS6"), label="US-down"
+        )
         self.ocr = OCREngine()
         self.translator = Translator()
 
@@ -1248,6 +1258,10 @@ def parse_args():
                    help="Path to custom class labels file (one per line)")
     p.add_argument("--fps", type=int, default=5,
                    help="Target detection FPS (lower = less power, default 5)")
+    p.add_argument("--us-front-device", default="/dev/ttyS2",
+                   help="Serial device for front ultrasonic (default /dev/ttyS2; use /dev/ttyS6 if ttyS2 missing)")
+    p.add_argument("--us-down-device", default="/dev/ttyS6",
+                   help="Serial device for downward ultrasonic (default /dev/ttyS6; use 'none' to disable)")
     return p.parse_args()
 
 
