@@ -1,68 +1,99 @@
 # Smart Eye Firmware
 
-Assistive vision system for visually impaired users, built on the Radxa CM5 (RK3588)
-with a custom carrier board. Features real-time object detection, OCR, audio feedback,
-and a complete battery-powered portable design with power management.
+Assistive vision system for visually impaired users, built on the Radxa CM5 (RK3588S)
+with a custom carrier board. Features real-time object detection (currency, potholes,
+stairs), OCR with text-to-speech, ultrasonic obstacle sensing, and audio/haptic
+feedback — all running fully offline.
 
 ## Hardware Platform
 
-| Component             | Part / Module                     | Interface        |
-|-----------------------|-----------------------------------|------------------|
-| SoM                   | Radxa CM5 (RK3588S)              | --               |
-| Camera                | IMX219 (RPi Camera v2)           | CSI (MIPI)       |
-| Ultrasonic sensor     | JSN-SR04T                        | UART6-M2         |
-| Speaker amplifier     | MAX98357A                        | I2S1-M0          |
-| Battery charger       | BQ25895RTWR (U2)                 | I2C3 @ 0x6A      |
-| Fuel gauge            | BQ27220YZFR (U20)                | I2C3 @ 0x55      |
-| Battery protection    | BQ29700DSER (U15)                | Hardware only     |
-| Battery               | 1S 10000 mAh Li-ion              | J5               |
-| Vibration motor       | ERM via N-FET                    | PWM7 (GPIO4_B3)  |
-| Buttons               | LANG_BTN, OCR_BTN, PWR (PMIC)   | GPIO / RK806     |
+| Component             | Part / Module                     | Interface              |
+|-----------------------|-----------------------------------|------------------------|
+| SoM                   | Radxa CM5 (RK3588S)              | —                      |
+| Camera                | IMX219 (RPi Camera v2)           | CSI (MIPI), /dev/video11 |
+| Ultrasonic (front)    | AJ-SR04M (Mode 4)               | UART2-M0 (/dev/ttyS2) |
+| Ultrasonic (down)     | AJ-SR04M (Mode 4)               | UART6-M2 (/dev/ttyS6) |
+| Speaker amplifier     | MAX98357A                        | I2S1-M0                |
+| Battery charger       | BQ25895RTWR (U2)                 | I2C3 @ 0x6A           |
+| Fuel gauge            | BQ27220YZFR (U20)                | I2C3 @ 0x55           |
+| Battery protection    | BQ29700DSER (U15)                | Hardware only          |
+| Battery               | 1S 10000 mAh Li-ion              | J5                     |
+| Vibration motor       | ERM via N-FET                    | PWM7 (GPIO4_B3)       |
+| Buttons               | LANG_BTN (GPIO0_D0), OCR_BTN (GPIO0_C7) | gpio-keys      |
+
+## Features
+
+- **Object Detection**: YOLOv8n PathPal model on RKNN NPU — detects Indian currency
+  denominations (₹1–₹2000), potholes, and stairs
+- **OCR**: RapidOCR (onnxruntime) with text-to-speech via Piper (English & Hindi)
+- **Translation**: Argostranslate English ↔ Hindi (offline)
+- **Ultrasonic Sensors**: Forward (180 cm threshold) and downward (135 cm threshold)
+  obstacle detection with 50 ms inter-sensor delay to prevent crosstalk
+- **Audio Feedback**: Pre-recorded WAV announcements + Piper TTS for OCR results
+- **Haptic Feedback**: PWM vibration motor with GPIO fallback
+- **Language Switch**: Hardware slide switch (LANG_BTN) — state read at startup via
+  EVIOCGKEY ioctl, live toggle during operation
+- **Battery Monitoring**: SOC, voltage, current, temperature, time-to-empty
+- **Power Management**: CPU governor tuning, GPU/NPU idle, unused service shutdown
+- **Camera Rotation**: 90° CCW rotation applied in background capture thread
+- **Fully Offline**: No internet required for any functionality
+- **Auto-Start**: systemd service launches on boot
 
 ## Project Structure
 
 ```
 Smart_eye_firmware/
-├── README.md                          # This file
-├── requirements.txt                   # Python dependencies
+├── README.md
+├── requirements.txt
 ├── power_config.py                    # Power system setup (charger + gauge + daemon)
+├── setup_tts.sh                       # TTS engine & voice model installer
+├── smart-eye-start.sh                 # Service control: start
+├── smart-eye-stop.sh                  # Service control: stop
+├── smart-eye-restart.sh               # Service control: restart
 │
 ├── overlays/                          # Device tree & kernel config
-│   ├── smart-eye-carrier.dts          # Current DT overlay source
-│   ├── smart-eye-carrier.dtbo         # Compiled overlay
-│   ├── rk3588-smart-eye-carrier.dts   # Legacy overlay variant
-│   ├── setup_uboot_gpio_fix.sh        # U-Boot vibration motor fix
-│   ├── Makefile                       # Build/install automation
-│   └── USAGE.md                       # Overlay & power management docs
+│   ├── smart-eye-carrier.dts
+│   ├── smart-eye-carrier.dtbo
+│   └── ...
+│
+├── Overlays/                          # Compiled overlay backups
+│   ├── smart-eye-carrier.dts
+│   └── rk3588-smart-eye-carrier.dtbo
 │
 ├── pathpal_project/                   # Main application
-│   ├── main.py                        # Entry point
-│   ├── CameraTest.py                  # Camera streaming & recording
-│   ├── LiveVideoDetection.py          # Real-time YOLO detection
-│   ├── ObjectDetection.py             # Detection pipeline
-│   ├── UltrasonicSensor.py            # Distance measurement (UART)
-│   ├── convert_yolov8.py              # ONNX → RKNN model converter
-│   └── yolov8.py                      # YOLOv8 inference wrapper
+│   ├── main.py                        # Entry point (Smart Eye app)
+│   ├── yolov8.py                      # YOLOv8 inference + post-processing
+│   └── py_utils/
+│       ├── rknn_executor.py           # RKNNLite model loader
+│       ├── coco_utils.py              # Letterbox + COCO helpers
+│       └── onnx_executor.py           # ONNX fallback loader
 │
-├── models/                            # ML models
-│   ├── pathpal/                       # PathPal YOLOv8 models
-│   └── yolov8/                        # Generic YOLOv8 assets
+├── models/
+│   ├── pathpal/                       # Active model
+│   │   ├── yolov8n_2912.rknn         # PathPal YOLOv8n (currency+pothole+stairs)
+│   │   └── labels.txt                 # 12 class labels
+│   └── yolov8/                        # Generic COCO model (not used)
 │
-├── tests/                             # Hardware & integration tests
-│   ├── test_all.py                    # Run all tests
+├── piper/                             # Piper TTS engine
+│   ├── piper/piper                    # Binary
+│   ├── en_US-amy-medium.onnx          # English voice model
+│   └── hi_IN-pratham-medium.onnx      # Hindi voice model
+│
+├── tests/
+│   ├── test_all.py                    # Run all hardware tests
 │   ├── test_camera.py                 # CSI camera pipeline test
-│   ├── test_audio.py                  # I2S / MAX98357A speaker test
-│   ├── test_pwm.py                    # Vibration motor PWM test
-│   ├── battery_test.py                # BQ25895 + BQ27220 status reader
+│   ├── test_camera_stream.py          # Live MJPEG stream over HTTP
+│   ├── test_audio.py                  # Speaker test
+│   ├── test_pwm.py                    # Vibration motor test
+│   ├── test_buttons.py                # GPIO button test
+│   ├── test_uart6.py                  # UART serial test
+│   ├── battery_test.py                # Charger + fuel gauge status
 │   ├── config_fuel_gauge.py           # BQ27220 data memory programmer
-│   ├── test_buttons.py                # GPIO button input test
-│   ├── test_i2c_bq27220.py           # Fuel gauge I2C test
-│   ├── test_uart6.py                  # UART6 loopback test
-│   └── test_overlay.sh               # Overlay load verification
+│   └── test_overlay.sh               # DT overlay verification
 │
 └── wav/                               # Audio feedback files
-    ├── English/                       # English voice prompts
-    └── Hindi/                         # Hindi voice prompts
+    ├── English/                       # English prompts
+    └── Hindi/                         # Hindi prompts
 ```
 
 ## Quick Start
@@ -79,17 +110,11 @@ sudo reboot
 
 ### 2. Configure the Power System
 
-Run once after assembly to program the charger, fuel gauge, and install
-the battery management daemon:
+Run once after assembly:
 
 ```bash
 sudo python3 ~/Smart_eye_firmware/power_config.py
 ```
-
-This configures:
-- **BQ25895**: 2A input limit, 2A charge current, 4.208V regulation, watchdog off
-- **BQ27220**: 10000 mAh design capacity, CEDV parameters
-- **Daemon**: installs `battery-mgr.service` for continuous monitoring
 
 ### 3. Install Python Dependencies
 
@@ -100,16 +125,105 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 4. Run the Application
+### 4. Install TTS Models
+
+```bash
+bash ~/Smart_eye_firmware/setup_tts.sh
+```
+
+### 5. Install Translation Packages (one-time, needs internet)
 
 ```bash
 source venv/bin/activate
-python pathpal_project/main.py
+argospm install translate-en_hi
+argospm install translate-hi_en
 ```
 
-## Power Management
+### 6. Run the Application
 
-The system includes a multi-layer battery protection stack:
+**Manual:**
+
+```bash
+cd ~/Smart_eye_firmware
+sudo -E venv/bin/python3 pathpal_project/main.py
+```
+
+**Via systemd service (auto-starts on boot):**
+
+```bash
+./smart-eye-start.sh       # Start
+./smart-eye-stop.sh        # Stop
+./smart-eye-restart.sh     # Restart
+
+# Or directly:
+sudo systemctl start smart-eye
+sudo systemctl stop smart-eye
+sudo systemctl restart smart-eye
+sudo systemctl status smart-eye
+```
+
+**View live logs:**
+
+```bash
+sudo journalctl -u smart-eye -f
+```
+
+## Detection Classes
+
+The PathPal model (`models/pathpal/yolov8n_2912.rknn`) detects 12 classes:
+
+| # | Class               | Audio Alert |
+|---|---------------------|-------------|
+| 0 | fifty rupees        | ✓           |
+| 1 | five hundred rupees | ✓           |
+| 2 | five rupees         | ✓           |
+| 3 | hundred rupees      | ✓           |
+| 4 | one rupees          | ✓           |
+| 5 | ten rupees          | ✓           |
+| 6 | twenty rupees       | ✓           |
+| 7 | two hundred rupees  | ✓           |
+| 8 | two rupees          | ✓           |
+| 9 | two thousand rupees | ✓           |
+| 10| pothole             | ✓ + vibration |
+| 11| stairs              | ✓ + vibration |
+
+## Ultrasonic Sensors
+
+| Sensor   | Port       | Direction | Threshold | Alert             |
+|----------|------------|-----------|-----------|-------------------|
+| US-front | /dev/ttyS2 | Forward   | 180 cm    | Vibration buzz    |
+| US-down  | /dev/ttyS6 | Downward  | 135 cm    | Vibration pulse   |
+
+Protocol: AJ-SR04M Mode 4 — send `0x01`, receive `0xFF H L SUM`, distance = `(H<<8|L)` mm.
+50 ms delay between sensor readings to prevent crosstalk.
+
+## Camera
+
+- Device: `/dev/video11` (rkisp_mainpath, IMX219)
+- Capture: 640×480 @ 10 FPS
+- Rotation: 90° counter-clockwise (applied in background capture thread)
+- All consumers (detection, OCR) receive pre-rotated frames
+
+### Live Camera Stream (for testing)
+
+```bash
+sudo -E venv/bin/python3 tests/test_camera_stream.py
+```
+
+Open `http://<board-ip>:8080` in a browser to view the MJPEG stream.
+Endpoints: `/` (web UI), `/stream` (raw MJPEG), `/snapshot` (single JPEG).
+
+## Language Switching
+
+- **Hardware**: LANG_BTN slide switch (GPIO0_D0, active-low via gpio-keys)
+- **Startup**: Physical switch position read via EVIOCGKEY ioctl
+  - Switch active (GPIO low) → English
+  - Switch released (GPIO high) → Hindi
+- **Runtime**: Toggle detected via input event polling
+- **OCR**: Recognized text spoken via Piper TTS in current language
+- **Translation**: English OCR text auto-translated to Hindi when in Hindi mode
+
+## Power Management
 
 ```
 ┌──────────────────────────────────────────────┐
@@ -123,73 +237,58 @@ The system includes a multi-layer battery protection stack:
 └──────────────────────────────────────────────┘
 ```
 
-### Power Button
-
-Short press on the RK806 PMIC power key triggers a clean shutdown with
-vibration feedback. Configuration is in `/etc/systemd/logind.conf.d/`.
-
-### Shutdown Sequence
-
-1. Vibration motor: 3 short buzzes (tactile confirmation)
-2. System gracefully shuts down all services
-3. If no USB charger connected: BQ25895 enters ship mode (BATFET off)
-4. System fully powers down with near-zero battery drain
+Runtime power optimizations applied at startup:
+- Little cores (cpu0-3): conservative governor
+- Big cores (cpu4-7): powersave governor
+- GPU: minimum frequency (userspace governor)
+- NPU: rknpu_ondemand governor
+- Unused services stopped (cups, avahi, bluetooth, gdm, etc.)
+- HDMI/DP outputs disabled
 
 ### Battery Status
 
 ```bash
-# Daemon log
-tail -f /var/log/battery-mgr.log
-
-# Full status report
 sudo python3 ~/Smart_eye_firmware/power_config.py --status
-
-# Daemon health
 systemctl status battery-mgr.service
+tail -f /var/log/battery-mgr.log
 ```
-
-See [`overlays/USAGE.md`](overlays/USAGE.md) for detailed power management
-documentation, register maps, and troubleshooting.
 
 ## Hardware Tests
 
 ```bash
 cd ~/Smart_eye_firmware
+source venv/bin/activate
 
-# Run all tests
-sudo python3 tests/test_all.py
-
-# Individual tests
-sudo python3 tests/test_camera.py       # CSI camera
-sudo python3 tests/test_audio.py        # Speaker output
-sudo python3 tests/test_pwm.py          # Vibration motor
-sudo python3 tests/battery_test.py      # Charger + fuel gauge
-sudo python3 tests/test_buttons.py      # GPIO buttons
-sudo python3 tests/test_uart6.py        # UART serial
-sudo bash tests/test_overlay.sh         # DT overlay verification
+sudo python3 tests/test_all.py            # All tests
+sudo python3 tests/test_camera.py          # Camera capture & recording
+sudo -E venv/bin/python3 tests/test_camera_stream.py  # Live MJPEG stream
+sudo python3 tests/test_audio.py           # Speaker output
+sudo python3 tests/test_pwm.py            # Vibration motor
+sudo python3 tests/battery_test.py         # Charger + fuel gauge
+sudo python3 tests/test_buttons.py         # GPIO buttons
+sudo python3 tests/test_uart6.py           # UART serial
+sudo bash tests/test_overlay.sh            # DT overlay verification
 ```
 
-## Camera
+## CLI Options
 
-```bash
-# Live camera feed (requires display)
-python pathpal_project/CameraTest.py
+```
+usage: main.py [-h] [--model MODEL] [--camera CAMERA] [--threshold THRESHOLD]
+               [--labels LABELS] [--fps FPS]
 
-# Headless mode (saves frames to disk)
-python pathpal_project/CameraTest.py --headless
-
-# Record video
-python pathpal_project/CameraTest.py --record --duration 30
+options:
+  --model MODEL         Path to RKNN model (default: models/pathpal/yolov8n_2912.rknn)
+  --camera CAMERA       V4L2 camera device (default: /dev/video11)
+  --threshold THRESHOLD Detection confidence threshold (default: 0.55)
+  --labels LABELS       Class labels file (default: models/pathpal/labels.txt)
+  --fps FPS             Target detection FPS (default: 5)
 ```
 
 ## Dependencies
 
-System packages:
-- `v4l-utils`, `libmraa2`, `libmraa-dev`, `mraa-tools`
-- `i2c-tools` (for power management)
+**System packages:** `v4l-utils`, `libmraa2`, `i2c-tools`
 
-Python packages: see `requirements.txt` (OpenCV, PyTorch, YOLOv8, NumPy, etc.)
+**Python packages:** see `requirements.txt` — OpenCV, NumPy, pyserial,
+rknn-toolkit-lite2, rapidocr-onnxruntime, argostranslate, etc.
 
-## License
-
-[Add your license here]
+**TTS:** Piper (local binary + ONNX voice models), espeak-ng (fallback)
