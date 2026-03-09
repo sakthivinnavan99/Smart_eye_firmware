@@ -92,7 +92,8 @@ def nms_boxes(boxes, scores):
         h1 = np.maximum(0.0, yy2 - yy1 + 0.00001)
         inter = w1 * h1
 
-        ovr = inter / (areas[i] + areas[order[1:]] - inter)
+        union = areas[i] + areas[order[1:]] - inter
+        ovr = inter / np.maximum(union, 1e-6)
         inds = np.where(ovr <= NMS_THRESH)[0]
         order = order[inds + 1]
     keep = np.array(keep)
@@ -129,96 +130,182 @@ def box_process(position):
 
     return xyxy
 
+def _sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-np.clip(x, -50, 50)))
+
+
+def _softmax(x, axis=-1):
+    """Numerically stable softmax."""
+    e = np.exp(x - np.max(x, axis=axis, keepdims=True))
+    return e / e.sum(axis=axis, keepdims=True)
+
+
+def _dfl_flat(raw_box, num_anchors):
+    """Apply DFL on a flat (1, 64, N) tensor and return decoded (N, 4) ltrb."""
+    reg_max = raw_box.shape[1] // 4  # typically 16
+    x = np.asarray(raw_box[0], dtype=np.float32)  # (64, N)
+    x = x.reshape(4, reg_max, num_anchors)
+    x = _softmax(x, axis=1)
+    conv = np.arange(reg_max, dtype=np.float32).reshape(1, reg_max, 1)
+    x = (x * conv).sum(axis=1)       # (4, N)
+    return x.T                        # (N, 4) — ltrb distances
+
+
+def _make_anchors(feat_sizes, strides):
+    """Generate anchor centres and stride array for given feature sizes."""
+    anchors, stride_arr = [], []
+    for (h, w), s in zip(feat_sizes, strides):
+        sy, sx = np.meshgrid(np.arange(h), np.arange(w), indexing='ij')
+        a = np.stack([sx.ravel(), sy.ravel()], axis=1).astype(np.float32) + 0.5
+        anchors.append(a)
+        stride_arr.append(np.full(h * w, s, dtype=np.float32))
+    return np.concatenate(anchors), np.concatenate(stride_arr)
+
+
+def _dist2bbox(anchors, strides, ltrb):
+    """Convert anchor + ltrb distances to xyxy boxes in pixel coords."""
+    lt = ltrb[:, :2]
+    rb = ltrb[:, 2:]
+    s = strides[:, None]
+    x1y1 = (anchors - lt) * s
+    x2y2 = (anchors + rb) * s
+    return np.concatenate([x1y1, x2y2], axis=1)
+
+
 def post_process(input_data):
     """
     Post-process YOLOv8 model output.
-    
-    Handles both formats:
-    1. Single unified output: (1, 84, 8400) - standard YOLOv8 format
-    2. Multi-output format: 6 tensors (3 branches × 2) - alternative format
+
+    Handles three output formats from RKNN:
+      A. 6 outputs: 3×3D + 3×4D — RKNN toolkit 2.x export with unfused tail.
+         Uses the 64ch DFL tensor + NC-ch raw-logit tensor, applies DFL decode
+         and sigmoid.
+      B. 6 outputs all 4D — old RKNN export (3 branches × box+class pair)
+      C. 1 output (1, NC+4, N) — fused single-output (Ultralytics default)
     """
-    # Check if we have the single unified output format
+    shapes = [x.shape for x in input_data]
+
+    tensors_3d = [(i, x) for i, x in enumerate(input_data) if len(x.shape) == 3]
+    tensors_4d = [(i, x) for i, x in enumerate(input_data) if len(x.shape) == 4]
+
+    # ---- Format A: mixed 3D+4D from RKNN 2.x --------------------------
+    # Find the (1,64,N) DFL tensor and the (1,NC,N) raw-logit tensor among 3D
+    # outputs.  DFL has 64 channels; the class tensor has NC channels and
+    # pre-sigmoid logits (negative min).  Use tmin < -10 to accept both
+    # strongly negative logits (e.g. -1e4) and milder ones (e.g. -50).
+    # If multiple candidates, prefer the one with the most negative min.
+    if tensors_3d and tensors_4d:
+        dfl_tensor = None
+        cls_tensor = None
+        cls_tmin = None
+        for _, t in tensors_3d:
+            if t.shape[1] == 64:
+                if dfl_tensor is None or t.flatten().min() < dfl_tensor.flatten().min():
+                    dfl_tensor = t
+            elif t.shape[1] != 64:
+                tmin = t.flatten().min()
+                if tmin < -10 and (cls_tmin is None or tmin < cls_tmin):
+                    cls_tensor = t
+                    cls_tmin = tmin
+
+        if dfl_tensor is not None and cls_tensor is not None:
+            num_classes = cls_tensor.shape[1]
+            num_anchors = cls_tensor.shape[2]
+
+            ltrb = _dfl_flat(dfl_tensor, num_anchors)
+
+            strides = [8, 16, 32]
+            feat_sizes = []
+            remaining = num_anchors
+            for s in strides:
+                h = IMG_SIZE[1] // s
+                w = IMG_SIZE[0] // s
+                feat_sizes.append((h, w))
+                remaining -= h * w
+
+            anchors, stride_arr = _make_anchors(feat_sizes, strides)
+            boxes_xyxy = _dist2bbox(anchors, stride_arr, ltrb)
+
+            class_scores = _sigmoid(cls_tensor[0].T)
+            max_scores = class_scores.max(axis=1)
+            mask = max_scores >= OBJ_THRESH
+
+            boxes_xyxy = boxes_xyxy[mask]
+            class_scores = class_scores[mask]
+            max_scores = max_scores[mask]
+
+            if len(boxes_xyxy) == 0:
+                return None, None, None
+
+            class_ids = np.argmax(class_scores, axis=1)
+
+            nboxes, nclasses, nscores = [], [], []
+            for c in set(class_ids):
+                inds = np.where(class_ids == c)[0]
+                b = boxes_xyxy[inds]
+                s = max_scores[inds]
+                keep = nms_boxes(b, s)
+                if len(keep) != 0:
+                    nboxes.append(b[keep])
+                    nclasses.append(np.full(len(keep), c))
+                    nscores.append(s[keep])
+
+            if not nclasses:
+                return None, None, None
+
+            return (np.concatenate(nboxes), np.concatenate(nclasses),
+                    np.concatenate(nscores))
+
+    # ---- Format C: single fused output (1, NC+4, N) --------------------
     if len(input_data) == 1:
         output = input_data[0]
-        
-        # Handle different possible shapes
         if output.shape[0] == 1:
-            # Remove batch dimension if present
-            output = output.squeeze(0)  # Now shape: (84, 8400) or similar
-        
-        # Transpose if needed to get (predictions, channels) format
-        if len(output.shape) == 2:
-            if output.shape[1] == 8400:  # (84, 8400) -> transpose to (8400, 84)
-                output = output.transpose(1, 0)
-        
-        # Now output should be (8400, 84) format
-        # Split into box coordinates and class probabilities
-        boxes = output[:, :4]  # First 4 values are box coordinates
-        classes_conf = output[:, 4:]  # Remaining 80 values are class scores
-        
-        # Create a confidence score (objectness * max_class_score)
-        objectness = classes_conf[:, 0] if classes_conf.shape[1] > 80 else np.ones(len(boxes))
-        class_scores = classes_conf[:, 1:81] if classes_conf.shape[1] > 80 else classes_conf[:, :80]
-        
-        # Filter by objectness threshold
-        mask = objectness >= OBJ_THRESH
+            output = output.squeeze(0)
+        if len(output.shape) == 2 and output.shape[0] < output.shape[1]:
+            output = output.transpose(1, 0)
+
+        boxes = output[:, :4]
+        class_scores = output[:, 4:]
+        max_scores = np.max(class_scores, axis=1)
+        mask = max_scores >= OBJ_THRESH
         boxes = boxes[mask]
         class_scores = class_scores[mask]
-        objectness = objectness[mask]
-        
+        max_scores = max_scores[mask]
+
         if len(boxes) == 0:
             return None, None, None
-        
-        # Get class predictions and scores
+
         class_ids = np.argmax(class_scores, axis=1)
-        class_max_scores = np.max(class_scores, axis=1)
-        scores = objectness * class_max_scores
-        
-        # Filter by class score threshold
-        mask = scores >= OBJ_THRESH
-        boxes = boxes[mask]
-        class_ids = class_ids[mask]
-        scores = scores[mask]
-        
-        if len(boxes) == 0:
-            return None, None, None
-        
-        # Convert from xywh to xyxy format
-        if boxes.shape[1] == 4:
-            boxes_xyxy = np.zeros_like(boxes)
-            boxes_xyxy[:, 0] = boxes[:, 0] - boxes[:, 2] / 2  # x1
-            boxes_xyxy[:, 1] = boxes[:, 1] - boxes[:, 3] / 2  # y1
-            boxes_xyxy[:, 2] = boxes[:, 0] + boxes[:, 2] / 2  # x2
-            boxes_xyxy[:, 3] = boxes[:, 1] + boxes[:, 3] / 2  # y2
-            boxes = boxes_xyxy
-        
-        # Apply NMS
+        boxes_xyxy = np.zeros_like(boxes)
+        boxes_xyxy[:, 0] = boxes[:, 0] - boxes[:, 2] / 2
+        boxes_xyxy[:, 1] = boxes[:, 1] - boxes[:, 3] / 2
+        boxes_xyxy[:, 2] = boxes[:, 0] + boxes[:, 2] / 2
+        boxes_xyxy[:, 3] = boxes[:, 1] + boxes[:, 3] / 2
+
         nboxes, nclasses, nscores = [], [], []
         for c in set(class_ids):
-            inds = np.where(class_ids == c)
-            b = boxes[inds]
-            s = scores[inds]
+            inds = np.where(class_ids == c)[0]
+            b = boxes_xyxy[inds]
+            s = max_scores[inds]
             keep = nms_boxes(b, s)
-            
             if len(keep) != 0:
                 nboxes.append(b[keep])
                 nclasses.append(np.full(len(keep), c))
                 nscores.append(s[keep])
-        
-        if not nclasses or not nscores:
+
+        if not nclasses:
             return None, None, None
-        
-        boxes = np.concatenate(nboxes)
-        classes = np.concatenate(nclasses)
-        scores = np.concatenate(nscores)
-        
-        return boxes, classes, scores
-    
-    # Original multi-output format handling
+
+        return np.concatenate(nboxes), np.concatenate(nclasses), np.concatenate(nscores)
+
+    # ---- Format B: all 4D (old RKNN 3-branch × 2) ----------------------
+    all_4d = all(len(x.shape) == 4 for x in input_data)
+    if not all_4d:
+        return None, None, None
+
     boxes, scores, classes_conf = [], [], []
-    defualt_branch=3
-    pair_per_branch = len(input_data)//defualt_branch
-    # Python 忽略 score_sum 输出
+    defualt_branch = 3
+    pair_per_branch = len(input_data) // defualt_branch
     for i in range(defualt_branch):
         boxes.append(box_process(input_data[pair_per_branch*i]))
         classes_conf.append(input_data[pair_per_branch*i+1])
@@ -237,10 +324,8 @@ def post_process(input_data):
     classes_conf = np.concatenate(classes_conf)
     scores = np.concatenate(scores)
 
-    # filter according to threshold
     boxes, classes, scores = filter_boxes(boxes, scores, classes_conf)
 
-    # nms
     nboxes, nclasses, nscores = [], [], []
     for c in set(classes):
         inds = np.where(classes == c)

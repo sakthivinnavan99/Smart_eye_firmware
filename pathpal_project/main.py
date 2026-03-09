@@ -1157,6 +1157,10 @@ class SmartEyeApp:
         elif label in ("pothole", "stairs"):
             self._play(label)
             self.vibrator.pulse(3, 200, 100, 80)
+        else:
+            log.info("TTS announce: %s", label)
+            self._tts_speak(f"{label} detected")
+            self.vibrator.buzz(200)
 
     # --- Main loop ---
     def run(self):
@@ -1182,6 +1186,9 @@ class SmartEyeApp:
                     continue
 
                 detections = self.detector.detect(frame)
+                if detections:
+                    log.info("Detections: %s",
+                             ", ".join(f'{d["label"]}({d["score"]:.2f})' for d in detections))
                 for det in detections:
                     self._announce(det["label"])
 
@@ -1231,7 +1238,7 @@ class SmartEyeApp:
 # ---------------------------------------------------------------------------
 def parse_args():
     p = argparse.ArgumentParser(description="Smart Eye assistive vision system")
-    p.add_argument("--model", default=os.path.join(PROJECT_ROOT, "models/pathpal/yolov8n_2912.rknn"),
+    p.add_argument("--model", default=os.path.join(PROJECT_ROOT, "models/pathpal/model_v2_large.rknn"),
                    help="Path to RKNN model file")
     p.add_argument("--camera", default="/dev/video11",
                    help="V4L2 camera device")
