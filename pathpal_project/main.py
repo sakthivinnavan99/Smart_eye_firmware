@@ -6,7 +6,7 @@ Assistive vision system for visually impaired users.
 
 Hardware platform: Radxa CM5 (RK3588S) on Smart Eye carrier board
   - Camera:      IMX219 via V4L2 (/dev/video11)
-  - Inference:   YOLOv8 on RKNN NPU
+  - Inference:   YOLOv8n PathPal on RKNN NPU (models/pathpal/yolov8n_2912.rknn)
   - Audio:       MAX98357A on ALSA Smart-Eye-Audio (card 2)
   - Buttons:     LANG_BTN (GPIO0_D0), OCR_BTN (GPIO0_C7) via gpio-keys
   - Vibration:   PWM7 on GPIO4_B3 via sysfs
@@ -14,7 +14,7 @@ Hardware platform: Radxa CM5 (RK3588S) on Smart Eye carrier board
   - Ultrasonic2: AJ-SR04M on UART6 (/dev/ttyS6) - downward
   - Battery:     BQ27220 fuel gauge on I2C3 (0x55)
   - OCR:         RapidOCR (onnxruntime)
-  - Translation: argostranslate (English <-> Hindi)
+  - Translation: argostranslate (English <-> Hindi, offline only)
 """
 
 import argparse
@@ -309,10 +309,13 @@ class ButtonListener:
             with open("/proc/bus/input/devices") as f:
                 content = f.read()
             for block in content.split("\n\n"):
-                if "smart-eye" not in block.lower():
+                if "smart-eye" not in block.lower() and "gpio-keys" not in block.lower():
                     continue
                 handler = None
+                name = ""
                 for line in block.split("\n"):
+                    if line.startswith("N: Name="):
+                        name = line.split("=", 1)[1].strip().strip('"')
                     if line.startswith("H: Handlers="):
                         for h in line.split("=")[1].split():
                             if h.startswith("event"):
@@ -322,15 +325,58 @@ class ButtonListener:
                     try:
                         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
                         self._fds[fd] = path
+                        log.info("Input device: %s -> %s (fd=%d)", name, path, fd)
                     except OSError:
                         log.warning("Cannot open %s (need root?)", path)
+            if not self._fds:
+                log.warning("No smart-eye / gpio-keys input devices found")
         except Exception as e:
             log.warning("Cannot enumerate input devices: %s", e)
+
+    @staticmethod
+    def _eviocgkey(length):
+        """Build EVIOCGKEY(length) ioctl number: _IOC(_IOC_READ, 'E', 0x18, length)."""
+        return 0x80004518 | (length << 16)
+
+    def read_key_state(self, keycode):
+        """Read current pressed/released state of a key via EVIOCGKEY ioctl.
+        Returns 1 if pressed (switch active), 0 if released, or None on error."""
+        import array
+        if not self._fds:
+            log.warning("read_key_state: no input fds open")
+            return None
+        buf_size = max((keycode // 8) + 1, 64)
+        for fd in self._fds:
+            try:
+                buf = array.array("B", bytes(buf_size))
+                fcntl.ioctl(fd, self._eviocgkey(buf_size), buf)
+                byte_idx = keycode // 8
+                bit_idx = keycode % 8
+                if byte_idx < len(buf):
+                    val = (buf[byte_idx] >> bit_idx) & 1
+                    log.info("EVIOCGKEY fd=%d keycode=0x%x byte[%d]=0x%02x bit%d -> %d",
+                             fd, keycode, byte_idx, buf[byte_idx], bit_idx, val)
+                    return val
+            except Exception as e:
+                log.warning("EVIOCGKEY ioctl failed on fd=%d: %s", fd, e)
+        return None
+
+    def drain(self):
+        """Discard any buffered input events so stale presses don't fire callbacks."""
+        for fd in self._fds:
+            while True:
+                try:
+                    data = os.read(fd, self.EVENT_SIZE * 16)
+                    if not data:
+                        break
+                except (BlockingIOError, OSError):
+                    break
 
     def start(self):
         if not self._fds:
             log.warning("No button input devices found")
             return
+        self.drain()
         self._running = True
         self._thread = threading.Thread(target=self._poll, daemon=True)
         self._thread.start()
@@ -607,7 +653,7 @@ class BatteryGauge:
 
 
 # ---------------------------------------------------------------------------
-#  Hardware abstraction: Ultrasonic sensor via UART6
+#  Hardware abstraction: Ultrasonic sensors via UART
 # ---------------------------------------------------------------------------
 class UltrasonicSensor:
     """AJ-SR04M ultrasonic sensor on UART (Mode 4: serial trigger/response).
@@ -670,7 +716,12 @@ class UltrasonicSensor:
 #  Camera + RKNN inference
 # ---------------------------------------------------------------------------
 class CameraDetector:
-    """V4L2 camera capture with YOLOv8 RKNN inference."""
+    """V4L2 camera capture with YOLOv8 RKNN inference.
+
+    All frames are rotated 90° counter-clockwise before use, so
+    both object detection and OCR always receive the correctly
+    oriented image.
+    """
 
     def __init__(self, model_path, device="/dev/video11",
                  target="rk3588", confidence=0.25, labels=None):
@@ -681,6 +732,9 @@ class CameraDetector:
         self.platform = None
         self.co_helper = None
         self.custom_labels = labels
+        self._frame_lock = threading.Lock()
+        self._latest_frame = None
+        self._cam_running = True
         self._init_camera()
         self._init_model(model_path, target)
 
@@ -695,7 +749,18 @@ class CameraDetector:
         self.cap.set(cv2.CAP_PROP_FPS, 10)
         w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        log.info("Camera %s opened at %dx%d", self.device, w, h)
+        log.info("Camera %s opened at %dx%d (rotated 90° CCW -> %dx%d)", self.device, w, h, h, w)
+        self._cam_thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self._cam_thread.start()
+
+    def _capture_loop(self):
+        """Continuously capture and rotate frames in background."""
+        while self._cam_running:
+            ret, frame = self.cap.read()
+            if ret:
+                rotated = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                with self._frame_lock:
+                    self._latest_frame = rotated
 
     def _init_model(self, model_path, target):
         if not os.path.isfile(model_path):
@@ -711,8 +776,8 @@ class CameraDetector:
         log.info("RKNN model loaded: %s", model_path)
 
     def grab_frame(self):
-        ret, frame = self.cap.read()
-        return frame if ret else None
+        with self._frame_lock:
+            return self._latest_frame.copy() if self._latest_frame is not None else None
 
     def detect(self, frame):
         img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -736,6 +801,7 @@ class CameraDetector:
         return results
 
     def close(self):
+        self._cam_running = False
         if self.cap:
             self.cap.release()
 
@@ -753,6 +819,10 @@ class OCREngine:
     def __init__(self):
         self._ocr = None
 
+    def warmup(self):
+        """Pre-load OCR models so first real call is fast."""
+        self._get_ocr()
+
     def _get_ocr(self):
         if self._ocr is None:
             from rapidocr_onnxruntime import RapidOCR
@@ -760,10 +830,10 @@ class OCREngine:
             log.info("RapidOCR (onnxruntime) initialized")
         return self._ocr
 
-    def recognize(self, frame, lang="en", scale=2.0):
+    def recognize(self, frame, lang="en", scale=1.5):
         h, w = frame.shape[:2]
         upscaled = cv2.resize(frame, (int(w * scale), int(h * scale)),
-                              interpolation=cv2.INTER_CUBIC)
+                              interpolation=cv2.INTER_LINEAR)
         ocr = self._get_ocr()
         result, _ = ocr(upscaled)
         texts = []
@@ -778,33 +848,38 @@ class OCREngine:
 #  Translation
 # ---------------------------------------------------------------------------
 class Translator:
-    """argostranslate wrapper for English <-> Hindi."""
+    """argostranslate wrapper for English <-> Hindi (fully offline).
+
+    Requires language packages to be pre-installed on the device.
+    Install once (with internet) via:
+        argospm install translate-en_hi
+        argospm install translate-hi_en
+    """
 
     def __init__(self):
-        self._installed = False
+        self._checked = False
+        self._tr = None
 
-    def _ensure_models(self):
-        if self._installed:
+    def _ensure_ready(self):
+        if self._checked:
             return
         try:
-            import argostranslate.package as pkg
             import argostranslate.translate as tr
-            pkg.update_package_index()
-            available = pkg.get_available_packages()
-            for p in available:
-                if (p.from_code == "en" and p.to_code == "hi") or \
-                   (p.from_code == "hi" and p.to_code == "en"):
-                    if not any(ip.from_code == p.from_code and ip.to_code == p.to_code
-                              for ip in pkg.get_installed_packages()):
-                        pkg.install_from_path(p.download())
-            self._installed = True
+            self._tr = tr
+            langs = {(t.from_language.code, t.to_language.code)
+                     for t in tr.get_installed_languages()
+                     for t in (t.translations_from if hasattr(t, 'translations_from') else [])}
+            self._checked = True
         except Exception as e:
-            log.warning("Translation model install failed: %s", e)
+            log.warning("Translation init failed (offline only): %s", e)
+            self._checked = True
 
     def translate(self, text, from_lang="en", to_lang="hi"):
-        self._ensure_models()
+        self._ensure_ready()
         try:
-            import argostranslate.translate as tr
+            tr = self._tr
+            if tr is None:
+                import argostranslate.translate as tr
             return tr.translate(text, from_lang, to_lang)
         except Exception as e:
             log.warning("Translation error: %s", e)
@@ -863,7 +938,7 @@ class SmartEyeApp:
     US_FRONT_THRESHOLD_CM = 180
     US_DOWN_THRESHOLD_CM = 135
     ANNOUNCE_COOLDOWN = 2.0
-    OCR_COOLDOWN = 3.0
+    OCR_COOLDOWN = 1.5
     BATTERY_INTERVAL = 30.0
     DETECTION_FPS = 5             # target detection frame rate (saves ~70% CPU vs unlimited)
     ULTRASONIC_INTERVAL = 0.5     # check ultrasonic every 500ms, not every frame
@@ -906,9 +981,38 @@ class SmartEyeApp:
             0x101: self._on_ocr_btn,
         })
         self.buttons.start()
+        self._init_language()
 
         self._battery_thread = threading.Thread(target=self._battery_loop, daemon=True)
         self._battery_thread.start()
+
+        threading.Thread(target=self.ocr.warmup, daemon=True).start()
+
+    def _init_language(self):
+        """Read the physical LANG_BTN switch position and set self.lang."""
+        lang_state = self.buttons.read_key_state(0x100)
+        if lang_state is None:
+            lang_state = self._read_lang_gpio()
+        if lang_state is not None:
+            self.lang = "en" if lang_state == 1 else "hi"
+            log.info("LANG_BTN initial state: %d -> language=%s", lang_state, self.lang)
+        else:
+            log.warning("Could not read LANG_BTN state, defaulting to %s", self.lang)
+
+    @staticmethod
+    def _read_lang_gpio():
+        """Fallback: read LANG_BTN GPIO0_D0 (gpio 24) via any available method."""
+        _LANG_GPIO = 24
+        try:
+            with open(f"/sys/class/gpio/gpio{_LANG_GPIO}/value") as f:
+                raw = int(f.read().strip())
+                val = 0 if raw == 1 else 1
+                log.info("LANG_BTN gpio%d sysfs raw=%d -> state=%d", _LANG_GPIO, raw, val)
+                return val
+        except OSError:
+            pass
+        log.warning("LANG_BTN GPIO fallback also failed")
+        return None
 
     @staticmethod
     def _load_labels(path):
@@ -948,7 +1052,7 @@ class SmartEyeApp:
             return
         self._last_ocr = now
         log.info("OCR triggered")
-        self.vibrator.buzz(200)
+        threading.Thread(target=lambda: self.vibrator.buzz(80), daemon=True).start()
         threading.Thread(target=self._run_ocr, daemon=True).start()
 
     # --- OCR ---
@@ -970,9 +1074,13 @@ class SmartEyeApp:
         else:
             self._tts_speak(text, force_lang="en")
 
+    _MAX_TTS_CHARS = 300
+
     def _tts_speak(self, text, force_lang=None):
         wav_out = "/tmp/smart_eye_tts.wav"
         lang = force_lang or self.lang
+        if len(text) > self._MAX_TTS_CHARS:
+            text = text[:self._MAX_TTS_CHARS]
         safe_text = text.replace('"', '\\"').replace("'", "\\'")
 
         try:
@@ -986,8 +1094,8 @@ class SmartEyeApp:
             if os.path.isfile(piper_bin) and os.path.isfile(model):
                 subprocess.run(
                     f'echo "{safe_text}" | "{piper_bin}" --model "{model}" '
-                    f'--output_file "{wav_out}"',
-                    shell=True, timeout=20,
+                    f'--length-scale 0.85 --output_file "{wav_out}"',
+                    shell=True, timeout=10,
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 )
                 self.audio.play(wav_out)
@@ -998,8 +1106,8 @@ class SmartEyeApp:
                 espeak = "/usr/bin/espeak"
             if os.path.isfile(espeak):
                 subprocess.run(
-                    [espeak, "-v", lang, "-w", wav_out, safe_text],
-                    timeout=10,
+                    [espeak, "-v", lang, "-s", "180", "-w", wav_out, safe_text],
+                    timeout=5,
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 )
                 self.audio.play(wav_out)
@@ -1123,13 +1231,13 @@ class SmartEyeApp:
 # ---------------------------------------------------------------------------
 def parse_args():
     p = argparse.ArgumentParser(description="Smart Eye assistive vision system")
-    p.add_argument("--model", default=os.path.join(PROJECT_ROOT, "models/yolov8/yolov8.rknn"),
+    p.add_argument("--model", default=os.path.join(PROJECT_ROOT, "models/pathpal/yolov8n_2912.rknn"),
                    help="Path to RKNN model file")
     p.add_argument("--camera", default="/dev/video11",
                    help="V4L2 camera device")
     p.add_argument("--threshold", type=float, default=0.55,
                    help="Detection confidence threshold")
-    p.add_argument("--labels", default=None,
+    p.add_argument("--labels", default=os.path.join(PROJECT_ROOT, "models/pathpal/labels.txt"),
                    help="Path to custom class labels file (one per line)")
     p.add_argument("--fps", type=int, default=5,
                    help="Target detection FPS (lower = less power, default 5)")

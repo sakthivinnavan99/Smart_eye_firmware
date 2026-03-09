@@ -6,8 +6,8 @@
 		title = "Smart Eye Custom Carrier Board";
 		compatible = "radxa,cm5-io";
 		category = "misc";
-		exclusive = "GPIO4_B3\0GPIO3_B7\0GPIO3_C0\0GPIO4_A4\0GPIO1_D1\0GPIO1_D0\0GPIO0_D3\0GPIO0_D0\0GPIO0_C7\0GPIO4_A3\0GPIO4_A1\0GPIO4_A2\0GPIO4_B2\0GPIO0_B5\0GPIO0_B6";
-		description = "Enable peripherals for Smart Eye custom carrier board:\n  - PWM15-M1 (GPIO4_B3) vibration motor\n  - I2C3-M1 (GPIO3_B7 SCL / GPIO3_C0 SDA) BQ27220 fuel gauge + BQ25895 charger\n  - GPIO4_A4 fuel gauge GPOUT interrupt\n  - UART6-M2 (GPIO1_D1 TX / GPIO1_D0 RX) ultrasonic sensor 1\n  - UART2-M0 (GPIO0_B5 TX / GPIO0_B6 RX) ultrasonic sensor 2\n  - GPIO0_D3 CHG_INT0_L charger interrupt\n  - GPIO0_D0 LANG_BTN, GPIO0_C7 OCR_BTN\n  - Speaker: MAX98357A on I2S1-M0 (SD_MODE via BSS138 on GPIO4_A3)\n  - I2S1 trcm-sync-tx-only: BCLK+LRCLK stop together (DC protection)";
+		exclusive = "GPIO4_B3\0GPIO3_B7\0GPIO3_C0\0GPIO4_A4\0GPIO1_D1\0GPIO1_D0\0GPIO0_D3\0GPIO0_D0\0GPIO0_C7\0GPIO4_A3\0GPIO4_A1\0GPIO4_A2\0GPIO4_B2";
+		description = "Enable peripherals for Smart Eye custom carrier board:\n  - PWM15-M1 (GPIO4_B3) vibration motor\n  - I2C3-M1 (GPIO3_B7 SCL / GPIO3_C0 SDA) BQ27220 fuel gauge + BQ25895 charger\n  - GPIO4_A4 fuel gauge GPOUT interrupt\n  - UART6-M2 (GPIO1_D1 TX / GPIO1_D0 RX) ultrasonic sensor (US-down)\n  - UART2-M0 via rk3588-disable-fiq-debugger overlay (US-front on J8)\n  - GPIO0_D3 CHG_INT0_L charger interrupt\n  - GPIO0_D0 LANG_BTN, GPIO0_C7 OCR_BTN\n  - Speaker: MAX98357A on I2S1-M0 (SD_MODE via BSS138 on GPIO4_A3)\n  - I2S1 trcm-sync-tx-only: BCLK+LRCLK stop together (DC protection)";
 	};
 
 	/*
@@ -177,19 +177,10 @@
 	};
 
 	/*
-	 * UART2-M0: Second ultrasonic sensor on GPIO0_B5 (TX) / GPIO0_B6 (RX)
-	 * Connected via J8 connector with 100R series resistors and ESD protection.
-	 * The base DTB already enables UART2 with uart2m0 pinmux, but we
-	 * explicitly set it here to ensure the mux is correct.
+	 * UART2-M0 for second ultrasonic sensor (US-front, J8 connector)
+	 * is handled by the rk3588-disable-fiq-debugger.dtbo overlay
+	 * which disables the FIQ debugger and enables uart2 with uart2m0_xfer.
 	 */
-	fragment@5b {
-		target = <&uart2>;
-		__overlay__ {
-			status = "okay";
-			pinctrl-names = "default";
-			pinctrl-0 = <&uart2m0_xfer>;
-		};
-	};
 
 	/*
 	 * Enable I2S1 (fe480000) with m0 pinctrl.
