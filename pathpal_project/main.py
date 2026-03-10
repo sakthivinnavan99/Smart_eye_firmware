@@ -660,31 +660,76 @@ class UltrasonicSensor:
 
     Protocol: send 0x01, receive 0xFF H_DATA L_DATA SUM.
     Distance = (H_DATA<<8 | L_DATA) in mm.
+
+    Supports reconnection when the sensor is powered on after boot (e.g. via
+    a manual power switch on UART2 to avoid boot hangs). If init fails or the
+    connection is lost, try_reconnect() is called periodically until the port
+    becomes available.
     """
+
+    RECONNECT_INTERVAL = 5.0   # seconds between reconnect attempts
+    FAIL_RESET_THRESHOLD = 20  # after this many consecutive no-response, close & retry (helps when sensor powered on late)
 
     def __init__(self, device="/dev/ttyS6", baudrate=9600, label="ultrasonic"):
         import serial
         self.label = label
+        self._last_reconnect = 0
+        self.ser = None
         if not device or str(device).lower() in ("none", "off", "disabled"):
-            self.ser = None
+            self._device = None
+            self._baudrate = baudrate
+            self._reconnect_enabled = False
+            self._consecutive_failures = 0
             log.info("%s sensor disabled (no device)", label)
+            return
+        self._device = device
+        self._baudrate = baudrate
+        self._reconnect_enabled = True
+        self._consecutive_failures = 0
+        self._try_connect()
+
+    def _try_connect(self):
+        """Attempt to open the serial port. Sets self.ser on success."""
+        import serial
+        if not self._reconnect_enabled or self._device is None:
             return
         try:
             self.ser = serial.Serial(
-                port=device, baudrate=baudrate,
+                port=self._device, baudrate=self._baudrate,
                 bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE,
                 stopbits=serial.STOPBITS_ONE, timeout=1.0,
             )
             self.ser.reset_input_buffer()
-            log.info("%s sensor on %s @ %d baud", label, device, baudrate)
+            log.info("%s sensor on %s @ %d baud", self.label, self._device, self._baudrate)
         except Exception as e:
-            log.warning("%s sensor init failed (%s): %s", label, device, e)
-            if "No such file or directory" in str(e) and "ttyS" in device:
+            log.warning("%s sensor init failed (%s): %s", self.label, self._device, e)
+            if "No such file or directory" in str(e) and "ttyS" in self._device:
                 log.info("If only /dev/ttyS6 exists, run with --us-front-device /dev/ttyS6 for one sensor, or enable UART2 in device tree for two.")
             self.ser = None
 
+    def try_reconnect(self):
+        """Reconnect if the port was unavailable. Throttled to avoid log spam."""
+        if not self._reconnect_enabled or self._device is None or self.ser is not None:
+            return
+        now = time.monotonic()
+        if now - self._last_reconnect < self.RECONNECT_INTERVAL:
+            return
+        self._last_reconnect = now
+        log.info("%s: attempting reconnection on %s", self.label, self._device)
+        self._try_connect()
+
+    def _close_port(self):
+        """Close serial port and clear handle (allows try_reconnect to reopen)."""
+        try:
+            if self.ser:
+                self.ser.close()
+        except Exception:
+            pass
+        self.ser = None
+
     def measure_mm(self):
         if self.ser is None:
+            self.try_reconnect()
             return None
         try:
             self.ser.reset_input_buffer()
@@ -699,14 +744,25 @@ class UltrasonicSensor:
                 time.sleep(0.01)
                 timeout += 1
             else:
+                self._consecutive_failures += 1
+                if self._consecutive_failures >= self.FAIL_RESET_THRESHOLD:
+                    log.info("%s: no response for %d reads, closing port to retry later (sensor powered on?)",
+                             self.label, self._consecutive_failures)
+                    self._close_port()
                 return None
 
             remaining = self.ser.read(3)
             if len(remaining) < 3:
+                self._consecutive_failures += 1
+                if self._consecutive_failures >= self.FAIL_RESET_THRESHOLD:
+                    self._close_port()
                 return None
             h, l, _ = remaining
+            self._consecutive_failures = 0
             return (h << 8) | l
-        except Exception:
+        except Exception as e:
+            log.info("%s read error (disconnected?): %s", self.label, e)
+            self._close_port()
             return None
 
     def measure_cm(self):
@@ -715,7 +771,11 @@ class UltrasonicSensor:
 
     def close(self):
         if self.ser:
-            self.ser.close()
+            try:
+                self.ser.close()
+            except Exception:
+                pass
+            self.ser = None
 
 
 # ---------------------------------------------------------------------------
@@ -941,13 +1001,14 @@ AUDIO_FILES = {
 #  Application
 # ---------------------------------------------------------------------------
 class SmartEyeApp:
-    US_FRONT_THRESHOLD_CM = 180
-    US_DOWN_THRESHOLD_CM = 135
+    US_FRONT_THRESHOLD_CM = 60
+    US_DOWN_THRESHOLD_CM = 130
     ANNOUNCE_COOLDOWN = 2.0
     OCR_COOLDOWN = 1.5
     BATTERY_INTERVAL = 30.0
     DETECTION_FPS = 5             # target detection frame rate (saves ~70% CPU vs unlimited)
     ULTRASONIC_INTERVAL = 0.5     # check ultrasonic every 500ms, not every frame
+    US_INTER_SENSOR_DELAY = 0.2   # delay between front and down to avoid acoustic crosstalk (seconds)
     GC_INTERVAL = 10.0            # gc.collect every 10s instead of every frame
 
     SOC_WARN = 20
@@ -1206,7 +1267,7 @@ class SmartEyeApp:
                 if now - self._last_ultrasonic >= self.ULTRASONIC_INTERVAL:
                     self._last_ultrasonic = now
                     d_front = self.us_front.measure_cm()
-                    time.sleep(0.05)
+                    time.sleep(self.US_INTER_SENSOR_DELAY)
                     d_down  = self.us_down.measure_cm()
 
                     if d_front is not None and d_front < self.US_FRONT_THRESHOLD_CM:
@@ -1252,7 +1313,7 @@ def parse_args():
                    help="Path to RKNN model file")
     p.add_argument("--camera", default="/dev/video11",
                    help="V4L2 camera device")
-    p.add_argument("--threshold", type=float, default=0.55,
+    p.add_argument("--threshold", type=float, default=0.65,
                    help="Detection confidence threshold")
     p.add_argument("--labels", default=os.path.join(PROJECT_ROOT, "models/pathpal/labels.txt"),
                    help="Path to custom class labels file (one per line)")
