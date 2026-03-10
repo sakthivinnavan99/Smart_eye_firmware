@@ -30,6 +30,7 @@ import subprocess
 import traceback
 import gc
 import logging
+import wave
 
 import cv2
 import numpy as np
@@ -498,6 +499,22 @@ class AudioPlayer:
     def play(self, wav_path):
         if os.path.isfile(wav_path):
             self._queue.put(wav_path)
+
+    def play_beep(self, freq=440, duration_ms=80, sample_rate=44100):
+        """Play a short beep on the speaker. Non-blocking; queued like play()."""
+        try:
+            n = int(sample_rate * duration_ms / 1000)
+            t = np.linspace(0, duration_ms / 1000, n, False)
+            samples = (np.sin(2 * np.pi * freq * t) * 0.3 * 32767).astype(np.int16)
+            path = "/tmp/smart_eye_beep.wav"
+            with wave.open(path, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(sample_rate)
+                w.writeframes(samples.tobytes())
+            self.play(path)
+        except Exception as e:
+            log.warning("Beep failed: %s", e)
 
     def _worker(self):
         while True:
@@ -1124,6 +1141,7 @@ class SmartEyeApp:
         self._last_ocr = now
         log.info("OCR triggered")
         threading.Thread(target=lambda: self.vibrator.buzz(80), daemon=True).start()
+        self.audio.play_beep()
         threading.Thread(target=self._run_ocr, daemon=True).start()
 
     # --- OCR ---
