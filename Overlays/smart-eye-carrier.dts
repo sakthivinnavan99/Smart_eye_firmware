@@ -7,7 +7,7 @@
 		compatible = "radxa,cm5-io";
 		category = "misc";
 		exclusive = "GPIO4_B3\0GPIO3_B7\0GPIO3_C0\0GPIO4_A4\0GPIO1_D1\0GPIO1_D0\0GPIO0_D3\0GPIO0_D0\0GPIO0_C7\0GPIO4_A3\0GPIO4_A1\0GPIO4_A2\0GPIO4_B2";
-		description = "Enable peripherals for Smart Eye custom carrier board:\n  - PWM15-M1 (GPIO4_B3) vibration motor\n  - I2C3-M1 (GPIO3_B7 SCL / GPIO3_C0 SDA) BQ27220 fuel gauge + BQ25895 charger\n  - GPIO4_A4 fuel gauge GPOUT interrupt\n  - UART6-M2 (GPIO1_D1 TX / GPIO1_D0 RX) ultrasonic sensor (US-down)\n  - UART2-M0 via rk3588-disable-fiq-debugger overlay (US-front on J8)\n  - GPIO0_D3 CHG_INT0_L charger interrupt\n  - GPIO0_D0 LANG_BTN, GPIO0_C7 OCR_BTN\n  - Speaker: MAX98357A on I2S1-M0 (SD_MODE via BSS138 on GPIO4_A3)\n  - I2S1 trcm-sync-tx-only: BCLK+LRCLK stop together (DC protection)";
+		description = "Enable peripherals for Smart Eye custom carrier board:\n  - PWM15-M1 (GPIO4_B3) vibration motor\n  - I2C3-M1 (GPIO3_B7 SCL / GPIO3_C0 SDA) BQ27220 fuel gauge + BQ25895 charger\n  - GPIO4_A4 fuel gauge GPOUT interrupt\n  - UART6-M2 (GPIO1_D1 TX / GPIO1_D0 RX) serial\n  - GPIO0_D3 CHG_INT0_L charger interrupt\n  - GPIO0_D0 LANG_BTN, GPIO0_C7 OCR_BTN\n  - Speaker: MAX98357A on I2S1-M0 (SD_MODE via BSS138 on GPIO4_A3)\n  - Headphone: ES8316 codec on I2S0 + I2C8-M2 (hp-det-gpio jack detect)\n  - I2S1 trcm-sync-tx-only: BCLK+LRCLK stop together (DC protection)";
 	};
 
 	/*
@@ -158,29 +158,27 @@
 	};
 
 	/*
-	 * ES8316 codec is NOT populated on this carrier board revision.
-	 * Explicitly disable the es8316-sound card and I2S0 controller
-	 * that the CM5-IO base DTB enables by default.
+	 * Re-enable the CM5-IO es8316-sound card and I2S0 controller.
+	 * ES8316 codec on I2C8-M2 (0x11) provides headphone output
+	 * via I2S0.  I2S0 has its own pins (separate from I2S1 which
+	 * drives the MAX98357A speaker).  Both can coexist.
+	 *
+	 * The base DTB es8316-sound node already has hp-det-gpio
+	 * for jack detection.  We just ensure both are enabled.
 	 */
 	fragment@5 {
 		target-path = "/es8316-sound";
 		__overlay__ {
-			status = "disabled";
+			status = "okay";
 		};
 	};
 
 	fragment@5a {
 		target = <&i2s0_8ch>;
 		__overlay__ {
-			status = "disabled";
+			status = "okay";
 		};
 	};
-
-	/*
-	 * UART2-M0 for second ultrasonic sensor (US-front, J8 connector)
-	 * is handled by the rk3588-disable-fiq-debugger.dtbo overlay
-	 * which disables the FIQ debugger and enables uart2 with uart2m0_xfer.
-	 */
 
 	/*
 	 * Enable I2S1 (fe480000) with m0 pinctrl.
