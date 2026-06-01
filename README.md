@@ -13,13 +13,39 @@ feedback — all running fully offline.
 | Camera                | IMX219 (RPi Camera v2)           | CSI (MIPI), /dev/video11 |
 | Ultrasonic (front)    | AJ-SR04M (Mode 4)               | UART2-M0 (/dev/ttyS2) |
 | Ultrasonic (down)     | AJ-SR04M (Mode 4)               | UART6-M2 (/dev/ttyS6) |
-| Speaker amplifier     | MAX98357A                        | I2S1-M0                |
+| Speaker amplifier     | MAX98357A (U10)                  | I2S1-M0, GPIO4_A3 SD_MODE |
 | Battery charger       | BQ25895RTWR (U2)                 | I2C3 @ 0x6A           |
 | Fuel gauge            | BQ27220YZFR (U20)                | I2C3 @ 0x55           |
 | Battery protection    | BQ29700DSER (U15)                | Hardware only          |
 | Battery               | 1S 10000 mAh Li-ion              | J5                     |
 | Vibration motor       | ERM via N-FET                    | PWM7 (GPIO4_B3)       |
 | Buttons               | LANG_BTN (GPIO0_D0), OCR_BTN (GPIO0_C7) | gpio-keys      |
+| Headphone output      | ES8316 codec (I2C8 @ 0x11)       | I2C8-M2, I2S0 (card 2)  |
+
+## Audio System
+
+Smart Eye has **two independent audio outputs** for different use cases:
+
+### Headphone Output (ES8316 Codec)
+- **Interface:** I2C8-M2 (GPIO1_D6/D7 @ 0x11), I2S0 (fe470000)
+- **ALSA Card:** `card 2: rockchipes8316`
+- **Features:** Jack detection via GPIO, audio routing controls
+- **Usage:** OCR results, voice feedback in noisy environments
+- **Test:** `aplay -D plughw:rockchipes8316,0 ~/Smart_eye_firmware/wav/English/battery_shutdown.wav`
+
+### Speaker Output (MAX98357A Amplifier)
+- **Interface:** I2S1-M0 (GPIO4_A1/A2/B2 for SCLK/LRCK/SDO1), GPIO4_A3 (SD_MODE, inverted)
+- **ALSA Card:** `card 3: SmartEyeAudio`
+- **Power Control:** GPIO 131 (LOW=amp ON, HIGH=amp OFF) — controlled by AudioPlayer
+- **Features:** Class-D amplifier, DC protection via synchronized BCLK/LRCK shutdown
+- **Usage:** Primary audio output (louder, more robust in outdoor use)
+- **Test:** `aplay -D plughw:SmartEyeAudio,0 ~/Smart_eye_firmware/wav/English/battery_shutdown.wav`
+
+**Note:** Mono WAV files auto-convert to stereo via `plughw:` prefix. For manual testing without the app:
+```bash
+sudo bash -c 'echo out > /sys/class/gpio/gpio131/direction; echo 0 > /sys/class/gpio/gpio131/value'
+aplay -D plughw:SmartEyeAudio,0 file.wav
+```
 
 ## Features
 
@@ -253,20 +279,52 @@ systemctl status battery-mgr.service
 tail -f /var/log/battery-mgr.log
 ```
 
+## Overlay Installation
+
+The custom carrier board requires a device tree overlay to configure all peripherals:
+
+```bash
+cd ~/Smart_eye_firmware/Overlays
+
+# Compile (on host with dtc) or use pre-built smart-eye-carrier.dtbo
+make
+
+# Install to boot partition
+sudo make install
+sudo make enable
+
+# Verify and reboot
+sudo make status
+sudo reboot
+```
+
+After reboot, verify with:
+```bash
+ls /boot/dtbo/smart-eye-carrier.dtbo         # Should exist
+dmesg | grep -i 'smart-eye\|i2s\|es8316'     # Check for load errors
+```
+
 ## Hardware Tests
 
 ```bash
 cd ~/Smart_eye_firmware
 source venv/bin/activate
 
+# Audio tests (verify both outputs)
+aplay -l                                       # List all sound cards
+aplay -D plughw:rockchipes8316,0 wav/English/battery_shutdown.wav   # Headphone test
+sudo bash -c 'echo out > /sys/class/gpio/gpio131/direction; echo 0 > /sys/class/gpio/gpio131/value'
+aplay -D plughw:SmartEyeAudio,0 wav/English/battery_shutdown.wav    # Speaker test
+
+# Full hardware test suite
 sudo python3 tests/test_all.py            # All tests
 sudo python3 tests/test_camera.py          # Camera capture & recording
 sudo -E venv/bin/python3 tests/test_camera_stream.py  # Live MJPEG stream
-sudo python3 tests/test_audio.py           # Speaker output
+sudo python3 tests/test_audio.py           # Speaker output test
 sudo python3 tests/test_pwm.py            # Vibration motor
 sudo python3 tests/battery_test.py         # Charger + fuel gauge
-sudo python3 tests/test_buttons.py         # GPIO buttons
-sudo python3 tests/test_uart6.py           # UART serial
+sudo python3 tests/test_buttons.py         # GPIO buttons (LANG_BTN, OCR_BTN)
+sudo python3 tests/test_uart6.py           # UART serial (ultrasonic)
 sudo bash tests/test_overlay.sh            # DT overlay verification
 ```
 
