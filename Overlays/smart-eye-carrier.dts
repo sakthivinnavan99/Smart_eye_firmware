@@ -6,8 +6,8 @@
 		title = "Smart Eye Custom Carrier Board";
 		compatible = "radxa,cm5-io";
 		category = "misc";
-		exclusive = "GPIO0_C5\0GPIO3_B7\0GPIO3_C0\0GPIO4_A4\0GPIO1_D1\0GPIO1_D0\0GPIO0_D3\0GPIO0_D0\0GPIO0_C7\0GPIO4_A3\0GPIO4_A1\0GPIO4_A2\0GPIO4_B2";
-		description = "Enable peripherals for Smart Eye custom carrier board:\n  - PWM4-M0 (GPIO0_C5) vibration motor\n  - I2C3-M1 (GPIO3_B7 SCL / GPIO3_C0 SDA) BQ27220 fuel gauge + BQ25895 charger\n  - GPIO4_A4 fuel gauge GPOUT interrupt\n  - UART6-M2 (GPIO1_D1 TX / GPIO1_D0 RX) front ultrasonic (US-front)\n  - GPIO0_D3 CHG_INT0_L charger interrupt\n  - GPIO0_D0 LANG_BTN, GPIO0_C7 OCR_BTN\n  - Speaker: MAX98357A on I2S1-M0 (SD_MODE via BSS138 on GPIO4_A3)\n  - Headphone: ES8316 codec on I2S0 + I2C8-M2 (hp-det-gpio jack detect)\n  - I2S1 trcm-sync-tx-only: BCLK+LRCLK stop together (DC protection)";
+		exclusive = "GPIO0_C5\0GPIO3_B7\0GPIO3_C0\0GPIO4_A4\0GPIO4_A5\0GPIO4_A6\0GPIO1_D1\0GPIO1_D0\0GPIO0_D3\0GPIO0_D0\0GPIO0_C7\0GPIO4_A3\0GPIO4_A1\0GPIO4_A2\0GPIO4_B2";
+		description = "Enable peripherals for Smart Eye custom carrier board:\n  - PWM4-M0 (GPIO0_C5) vibration motor\n  - I2C3-M1 (GPIO3_B7 SCL / GPIO3_C0 SDA) BQ27220 fuel gauge + BQ25895 charger\n  - GPIO4_A4 fuel gauge GPOUT interrupt\n  - UART3-M2 (GPIO4_A5 TX / GPIO4_A6 RX) front ultrasonic (US-front)\n  - UART6-M2 (GPIO1_D1 TX / GPIO1_D0 RX) bottom ultrasonic (US-down)\n  - GPIO0_D3 CHG_INT0_L charger interrupt\n  - GPIO0_D0 LANG_BTN, GPIO0_C7 OCR_BTN\n  - Speaker: MAX98357A on I2S1-M0 (SD_MODE via BSS138 on GPIO4_A3)\n  - Headphone: ES8316 codec on I2S0 + I2C8-M2 (hp-det-gpio jack detect)\n  - I2S1 trcm-sync-tx-only: BCLK+LRCLK stop together (DC protection)";
 	};
 
 	/*
@@ -97,8 +97,26 @@
 		};
 	};
 
-	/* UART6-M2: Front ultrasonic sensor (US-front) on GPIO1_D1 (TX) / GPIO1_D0 (RX) */
+	/*
+	 * UART3-M2: Front ultrasonic sensor (US-front) on GPIO4_A5 (TX) / GPIO4_A6 (RX)
+	 *
+	 * Maps to /dev/ttyS3 in the OS.
+	 */
 	fragment@3 {
+		target = <&uart3>;
+		__overlay__ {
+			status = "okay";
+			pinctrl-names = "default";
+			pinctrl-0 = <&uart3m2_xfer>;
+		};
+	};
+
+	/*
+	 * UART6-M2: Bottom ultrasonic sensor (US-down) on GPIO1_D1 (TX) / GPIO1_D0 (RX)
+	 *
+	 * Maps to /dev/ttyS6 in the OS.
+	 */
+	fragment@3a {
 		target = <&uart6>;
 		__overlay__ {
 			status = "okay";
