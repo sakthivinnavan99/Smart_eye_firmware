@@ -1,24 +1,38 @@
 #!/usr/bin/env python3
 """
-Audio test for Smart Eye board speaker (MAX98357A on I2S1).
+Audio test for Smart Eye board speaker and headphone.
 
-Tests the full audio path including:
-  - ALSA card detection
-  - SDO1 routing (PATH0 -> SDO1 for MAX98357A DIN)
-  - Softvol initialisation and volume control
-  - SD_MODE GPIO control via BSS138 (inverted logic)
-  - WAV playback with proper amp enable/disable sequencing
-  - Speaker DC-protection verification (amp OFF after playback)
+Tests both audio outputs:
+  SPEAKER (MAX98357A on I2S1, card 3):
+    - ALSA card detection
+    - SDO1 routing (PATH0 -> SDO1 for MAX98357A DIN)
+    - Softvol initialisation and volume control
+    - SD_MODE GPIO control via BSS138 (inverted logic)
+    - WAV playback with amp enable/disable sequencing
+    - DC-protection verification (amp OFF after playback)
+
+  HEADPHONE (ES8316 on I2C8-M2/I2S0, card 2):
+    - I2C8 codec detection and availability
+    - I2S0 audio delivery
+    - Mono-to-stereo conversion via plughw
+
+Device tree overlay: Overlays/smart-eye-carrier.dts
+  - fragment@5: es8316-sound machine driver (enabled)
+  - fragment@5a: i2s0_8ch controller (enabled)
+  - fragment@6: i2s1_8ch with pin conflict fix + LRCK signal fix
+  - fragment@7: smart-eye-sound speaker card
 
 Hardware:
-  BSS138 (Q1) controls MAX98357A SD_MODE with inverted logic:
+  BSS138 (Q1) inverted logic for MAX98357A SD_MODE:
     AMP_SD (GPIO4_A3 / gpio131) HIGH -> Q1 ON  -> SD_MODE LOW  -> amp OFF
     AMP_SD (GPIO4_A3 / gpio131) LOW  -> Q1 OFF -> pullup -> SD_MODE HIGH -> amp ON
 
 Usage:
-    sudo python3 test_audio.py                   # play all files
-    sudo python3 test_audio.py device_turned_on   # play matching file
-    sudo python3 test_audio.py --card-only        # just check card & mixer
+    sudo python3 test_audio.py                     # test both speaker and headphone
+    sudo python3 test_audio.py speaker             # speaker only
+    sudo python3 test_audio.py headphone           # headphone only
+    sudo python3 test_audio.py device_turned_on    # play matching file
+    sudo python3 test_audio.py --card-only         # just check cards & mixers
 """
 
 import subprocess, sys, os, glob, time, wave
@@ -145,9 +159,55 @@ def play(path, use_softvol=True):
     return rc == 0, elapsed
 
 
+def find_headphone_card():
+    """Find ES8316 headphone card."""
+    rc, out, _ = run("cat /proc/asound/cards")
+    for line in out.splitlines():
+        if "rockchipes8316" in line.lower():
+            return int(line.strip().split()[0])
+    return None
+
+
+def test_headphone(files):
+    """Test headphone output via ES8316 codec on I2C8-M2/I2S0."""
+    print("\n" + "=" * 60)
+    print("  Headphone Test (ES8316 on I2C8-M2/I2S0)")
+    print("=" * 60)
+
+    card = find_headphone_card()
+    if card is None:
+        print("\n[SKIP] ES8316 headphone card not found")
+        print("       (Verify overlay is installed and reboot)")
+        return
+
+    print(f"\n[OK]   Card {card}: rockchipes8316")
+
+    if not files:
+        print(f"\n[FAIL] No WAV files found for headphone test")
+        return
+
+    print(f"\n  Playing {len(files)} file(s) on headphone\n")
+    print(f"  {'File':<35s} {'Format':<26s} {'Time':>6s}  {'Status'}")
+    print(f"  {'-'*35} {'-'*26} {'-'*6}  {'-'*12}")
+
+    for path in files[:3]:  # Test only first 3 files
+        name = os.path.basename(path)
+        info = wav_info(path)
+
+        # Use plughw: prefix for mono→stereo conversion
+        rc, _, _ = run(f"aplay -D plughw:rockchipes8316,0 '{path}'", timeout=30)
+        ok = rc == 0
+        dur = wav_info(path).split()[-2] if 's' in wav_info(path) else '?'
+
+        status = "PASS" if ok else "FAIL"
+        print(f"  {name:<35s} {info:<26s} {dur:>6s}  {status}")
+
+    print()
+
+
 def main():
     print("=" * 60)
-    print("  Smart Eye Speaker Test  (MAX98357A + BSS138 SD_MODE)")
+    print("  Smart Eye Audio Test  (Headphone + Speaker)")
     print("=" * 60)
 
     # 1. Find card
@@ -200,13 +260,21 @@ def main():
         sys.exit(1)
 
     argv_filter = [a for a in sys.argv[1:] if not a.startswith("--")]
+    test_speaker = True
+    test_headphone = True
+
     if argv_filter:
         keyword = argv_filter[0].lower()
-        files = [f for f in files if keyword in os.path.basename(f).lower()]
-        if not files:
-            print(f"\n[FAIL] No files matching '{keyword}'")
-            gpio_unexport()
-            sys.exit(1)
+        if keyword == "speaker":
+            test_headphone = False
+        elif keyword == "headphone":
+            test_speaker = False
+        else:
+            files = [f for f in files if keyword in os.path.basename(f).lower()]
+            if not files:
+                print(f"\n[FAIL] No files matching '{keyword}'")
+                gpio_unexport()
+                sys.exit(1)
 
     print(f"\n  Playing {len(files)} file(s)\n")
     print(f"  {'File':<35s} {'Format':<26s} {'Time':>6s}  {'Status'}")
@@ -236,22 +304,28 @@ def main():
 
     amp_off()
 
-    print(f"\n  Results: {passed} passed, {failed} failed / {len(files)}")
-    print(f"  AMP_SD final state: {'HIGH (amp OFF)' if amp_is_off() else 'LOW (amp ON!)'}")
+    if test_speaker:
+        print(f"\n  Results: {passed} passed, {failed} failed / {len(files)}")
+        print(f"  AMP_SD final state: {'HIGH (amp OFF)' if amp_is_off() else 'LOW (amp ON!)'}")
 
-    # 7. DC-protection hold test
-    print(f"\n  DC-protection hold test (5s)...", end="", flush=True)
-    all_off = True
-    for _ in range(25):
-        if not amp_is_off():
-            all_off = False
-            break
-        time.sleep(0.2)
-    print(f"  {'PASS' if all_off else 'FAIL'} — amp stayed {'OFF' if all_off else 'ON!'}")
+        # 7. DC-protection hold test
+        print(f"\n  DC-protection hold test (5s)...", end="", flush=True)
+        all_off = True
+        for _ in range(25):
+            if not amp_is_off():
+                all_off = False
+                break
+            time.sleep(0.2)
+        print(f"  {'PASS' if all_off else 'FAIL'} — amp stayed {'OFF' if all_off else 'ON!'}")
 
     gpio_unexport()
+
+    # 8. Headphone test (if requested)
+    if test_headphone:
+        test_headphone_audio(files)
+
     print("=" * 60)
-    sys.exit(1 if failed else 0)
+    sys.exit(1 if (failed > 0 if test_speaker else False) else 0)
 
 
 if __name__ == "__main__":

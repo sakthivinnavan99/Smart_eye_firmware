@@ -46,6 +46,11 @@ TESTS = [
         "cmd": [sys.executable, os.path.join(TESTS_DIR, "test_camera.py")],
         "interactive": False,
     },
+    {
+        "name": "Audio System (Headphone + Speaker)",
+        "cmd": [sys.executable, os.path.join(TESTS_DIR, "test_audio.py")],
+        "interactive": True,
+    },
 ]
 
 

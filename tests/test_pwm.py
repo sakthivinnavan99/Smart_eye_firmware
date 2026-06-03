@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """
-Test vibration motor on GPIO4_B3 (PWM7-M1 in Radxa BSP).
+Test vibration motor on GPIO0_C5 (PWM4-M0).
 
-The Radxa BSP kernel maps the PWM controller at 0xfebd0030 as "pwm7"
-(not "pwm15" -- that label points to a different controller at 0xfebf0030).
+The RK3588S SoC has PWM controllers at:
+  - 0xfebd0000: pwm4 (GPIO0_C5 in M0 mode)
+  - 0xfebd0010: pwm5
+  - 0xfebd0020: pwm6
+  - 0xfebd0030: pwm7 (old config, no longer used)
 
 This script:
-  1. Releases GPIO 139 if the init service holds it
-  2. Finds the correct pwmchip for febd0030
-  3. Runs PWM tests with duty cycle sweeps and patterns
+  1. Finds the correct pwmchip for 0xfebd0000 (pwm4)
+  2. Runs PWM tests with duty cycle sweeps and patterns
+  3. Falls back to GPIO on/off if PWM unavailable
+
+Device tree overlay: Overlays/smart-eye-carrier.dts (fragment@0)
 
 Run with: sudo python3 test_pwm.py
 """
@@ -18,8 +23,8 @@ import sys
 import time
 import glob
 
-PWM_REG_ADDR = "febd0030"
-GPIO_NUM = 139
+PWM_REG_ADDR = "febd0000"
+GPIO_NUM = 21  # GPIO0_C5
 
 
 def release_gpio():
@@ -203,7 +208,7 @@ def main():
 
     print("=" * 45)
     print(" Vibration Motor Test")
-    print(" Pin: GPIO4_B3 (PWM7-M1, reg {})".format(PWM_REG_ADDR))
+    print(" Pin: GPIO0_C5 (PWM4-M0, reg {})".format(PWM_REG_ADDR))
     print("=" * 45)
 
     release_gpio()
