@@ -3,7 +3,7 @@ KERNEL_VER := $(shell uname -r)
 OVERLAY_DIR := /usr/lib/linux-image-$(KERNEL_VER)/rockchip/overlays
 BOOT_DTBO_DIR := /boot/dtbo
 
-DTS := rk3588-smart-eye-carrier.dts
+DTS := smart-eye-carrier.dts
 DTBO := $(DTS:.dts=.dtbo)
 
 .PHONY: all clean install enable disable status
@@ -59,13 +59,15 @@ status:
 	fi
 	@echo ""
 	@echo "=== Peripherals Configured ==="
-	@echo "  PWM15-M1  (GPIO4_B3)         -> Vibration motor"
-	@echo "  I2C3-M1   (GPIO3_B7 SCL / GPIO3_C0 SDA) -> BQ27220 fuel gauge"
-	@echo "  GPIO4_A4                      -> Fuel gauge interrupt"
-	@echo "  UART6-M2  (GPIO1_D1/GPIO1_D0) -> Serial port"
-	@echo "  GPIO0_D3  CHG_INT0_L          -> Charger interrupt (active low)"
-	@echo "  GPIO0_D0  LANG_BTN            -> Language select button (active low)"
-	@echo "  GPIO0_C7  OCR_BTN             -> OCR trigger button (active low)"
-	@echo "  I2S0      ES8316 + MAX98357A  -> Headphone + Speaker (auto-switch)"
-	@echo "  GPIO4_A3  AMP_SD             -> MAX98357A speaker enable"
-	@echo "  GPIO1_C0  HP_DET             -> Headphone jack detect"
+	@echo "  PWM4-M0   (GPIO0_C5)                  -> Vibration motor"
+	@echo "  I2C3-M1   (GPIO3_B7 SCL / GPIO3_C0 SDA) -> BQ27220 fuel gauge + BQ25895 charger"
+	@echo "  GPIO4_A4                              -> Fuel gauge interrupt"
+	@echo "  UART3-M2  (GPIO4_A5 TX / GPIO4_A6 RX) -> Front ultrasonic (US-front)"
+	@echo "  UART6-M2  (GPIO1_D1 TX / GPIO1_D0 RX) -> Bottom ultrasonic (US-down)"
+	@echo "  GPIO0_D3  CHG_INT0_L                  -> Charger interrupt (active low)"
+	@echo "  GPIO0_D0  LANG_BTN                    -> Language select button (active low)"
+	@echo "  GPIO0_C7  OCR_BTN                     -> OCR trigger button (active low)"
+	@echo "  I2C8-M2   (GPIO1_D6 SCL / GPIO1_D7 SDA) -> ES8316 codec (headphone)"
+	@echo "  I2S0      (GPIO2_A0-2_B3)             -> ES8316 audio (MCLK + I2S data)"
+	@echo "  I2S1-M0   (GPIO4_A1/A2/B2)           -> MAX98357A speaker (I2S data)"
+	@echo "  GPIO4_A3  AMP_SD                      -> MAX98357A speaker enable (inverted)"
