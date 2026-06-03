@@ -10,8 +10,8 @@ Hardware platform: Radxa CM5 (RK3588S) on Smart Eye carrier board
   - Audio:       MAX98357A on ALSA Smart-Eye-Audio (card 2)
   - Buttons:     LANG_BTN (GPIO0_D0), OCR_BTN (GPIO0_C7) via gpio-keys
   - Vibration:   PWM7 on GPIO4_B3 via sysfs
-  - Ultrasonic1: AJ-SR04M on UART2 (/dev/ttyS2) - forward facing (J8)
-  - Ultrasonic2: AJ-SR04M on UART6 (/dev/ttyS6) - downward
+  - Ultrasonic1: AJ-SR04M on UART3 (/dev/ttyS3) - front facing
+  - Ultrasonic2: AJ-SR04M on UART6 (/dev/ttyS6) - bottom facing
   - Battery:     BQ27220 fuel gauge on I2C3 (0x55)
   - OCR:         RapidOCR (onnxruntime)
   - Translation: argostranslate (English <-> Hindi, offline only)
@@ -721,7 +721,7 @@ class UltrasonicSensor:
         except Exception as e:
             log.warning("%s sensor init failed (%s): %s", self.label, self._device, e)
             if "No such file or directory" in str(e) and "ttyS" in self._device:
-                log.info("If only /dev/ttyS6 exists, run with --us-front-device /dev/ttyS6 for one sensor, or enable UART2 in device tree for two.")
+                log.info("Serial port %s not found. Verify UART overlay is installed and device tree is compiled.", self._device)
             self.ser = None
 
     def try_reconnect(self):
@@ -1337,10 +1337,10 @@ def parse_args():
                    help="Path to custom class labels file (one per line)")
     p.add_argument("--fps", type=int, default=5,
                    help="Target detection FPS (lower = less power, default 5)")
-    p.add_argument("--us-front-device", default="/dev/ttyS2",
-                   help="Serial device for front ultrasonic (default /dev/ttyS2; use /dev/ttyS6 if ttyS2 missing)")
+    p.add_argument("--us-front-device", default="/dev/ttyS3",
+                   help="Serial device for front ultrasonic (default /dev/ttyS3 via UART3-M2)")
     p.add_argument("--us-down-device", default="/dev/ttyS6",
-                   help="Serial device for downward ultrasonic (default /dev/ttyS6; use 'none' to disable)")
+                   help="Serial device for bottom ultrasonic (default /dev/ttyS6 via UART6-M2; use 'none' to disable)")
     return p.parse_args()
 
 

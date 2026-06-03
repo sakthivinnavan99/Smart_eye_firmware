@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Test UART6 serial port on GPIO1_D1 (TX) / GPIO1_D0 (RX).
+Test UART3 serial port on GPIO4_A5 (TX) / GPIO4_A6 (RX).
 
-Connected to: AJ-SR04M bottom ultrasonic sensor (US-down)
+Connected to: AJ-SR04M front ultrasonic sensor (US-front)
 
 Tests:
   1. Device existence
@@ -11,9 +11,9 @@ Tests:
   4. Transmit-only test (no loopback needed)
   5. Receive test (waits for external data from ultrasonic)
 
-Device tree overlay: Overlays/smart-eye-carrier.dts (fragment@3a)
+Device tree overlay: Overlays/smart-eye-carrier.dts (fragment@3)
 
-Run with: sudo python3 test_uart6.py
+Run with: sudo python3 test_uart3.py
 """
 
 import os
@@ -22,7 +22,7 @@ import time
 import termios
 import select
 
-UART_DEV = "/dev/ttyS6"
+UART_DEV = "/dev/ttyS3"
 DEFAULT_BAUD = 9600
 
 BAUD_MAP = {
@@ -94,12 +94,12 @@ class UARTDev:
 
 
 def test_device_exists():
-    print("\n--- Test 1: UART6 Device ---")
+    print("\n--- Test 1: UART3 Device ---")
     if os.path.exists(UART_DEV):
         print("  [PASS] {} exists".format(UART_DEV))
         return True
     else:
-        print("  [FAIL] {} not found. Is UART6 overlay enabled?".format(UART_DEV))
+        print("  [FAIL] {} not found. Is UART3 overlay enabled?".format(UART_DEV))
         return False
 
 
@@ -124,7 +124,7 @@ def test_open_close():
 
 def test_loopback():
     print("\n--- Test 3: Loopback Test (TX -> RX) ---")
-    print("  NOTE: Requires TX (GPIO1_D1) connected to RX (GPIO1_D0)")
+    print("  NOTE: Requires TX (GPIO4_A5) connected to RX (GPIO4_A6)")
 
     uart = UARTDev(UART_DEV, DEFAULT_BAUD)
     try:
@@ -165,7 +165,7 @@ def test_transmit():
         uart.open()
 
         messages = [
-            b"Smart Eye UART6 Test\r\n",
+            b"Smart Eye UART3 Test\r\n",
             b"Hello from Radxa CM5\r\n",
             bytes(range(256)),
         ]
@@ -180,7 +180,7 @@ def test_transmit():
             time.sleep(0.05)
 
         print("  [PASS] All packets transmitted")
-        print("  Verify with oscilloscope or USB-serial adapter on TX (GPIO1_D1)")
+        print("  Verify with oscilloscope or USB-serial adapter on TX (GPIO4_A5)")
 
     except Exception as e:
         print("  [FAIL] Transmit error: {}".format(e))
@@ -190,7 +190,7 @@ def test_transmit():
 
 def test_receive(duration=5):
     print("\n--- Test 5: Receive Test ({}s window) ---".format(duration))
-    print("  Send data to RX (GPIO1_D0) now...")
+    print("  Send data to RX (GPIO4_A6) now...")
 
     uart = UARTDev(UART_DEV, DEFAULT_BAUD)
     try:
@@ -224,13 +224,13 @@ def test_receive(duration=5):
 
 def main():
     if os.geteuid() != 0:
-        print("This test requires root. Run with: sudo python3 test_uart6.py")
+        print("This test requires root. Run with: sudo python3 test_uart3.py")
         sys.exit(1)
 
     print("========================================")
-    print(" UART6 Serial Port Test")
+    print(" UART3 Serial Port Test")
     print(" Device: {}".format(UART_DEV))
-    print(" TX: GPIO1_D1 | RX: GPIO1_D0")
+    print(" TX: GPIO4_A5 | RX: GPIO4_A6")
     print(" Default: {} 8N1".format(DEFAULT_BAUD))
     print("========================================")
 
@@ -244,7 +244,7 @@ def main():
         test_receive()
 
         print("\n========================================")
-        print(" All UART6 tests complete!")
+        print(" All UART3 tests complete!")
         print("========================================")
     except KeyboardInterrupt:
         print("\n\nInterrupted!")

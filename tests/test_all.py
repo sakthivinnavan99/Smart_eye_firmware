@@ -32,7 +32,12 @@ TESTS = [
         "interactive": False,
     },
     {
-        "name": "UART6 Serial Port",
+        "name": "UART3 Serial Port (Front Ultrasonic)",
+        "cmd": [sys.executable, os.path.join(TESTS_DIR, "test_uart3.py")],
+        "interactive": True,
+    },
+    {
+        "name": "UART6 Serial Port (Bottom Ultrasonic)",
         "cmd": [sys.executable, os.path.join(TESTS_DIR, "test_uart6.py")],
         "interactive": True,
     },
