@@ -1,0 +1,13 @@
+[Unit]
+Description=Force vibration motor GPIO low then init PWM
+DefaultDependencies=no
+Before=sysinit.target
+After=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/vibration-motor-init.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=sysinit.target

@@ -1,0 +1,12 @@
+[Unit]
+Description=Enter BQ25895 ship mode before power off
+DefaultDependencies=no
+Before=poweroff.target halt.target
+After=final.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/battery-mgr/shutdown_ship_mode.sh
+
+[Install]
+WantedBy=poweroff.target halt.target
