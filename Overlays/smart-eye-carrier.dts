@@ -245,12 +245,10 @@
 			status = "okay";
 			i2s-lrck-gpio = <0x00>;
 			rockchip,i2s-tx-route = <1 0 2 3>;
-			rockchip,i2s-rx-route = <0 1 2 3>;
 			rockchip,trcm-sync-tx-only;
 			pinctrl-names = "default";
 			pinctrl-0 = <&i2s1m0_sclk
 				     &i2s1m0_lrck
-				     &i2s1m0_sdi0
 				     &i2s1m0_sdo1>;
 		};
 	};
