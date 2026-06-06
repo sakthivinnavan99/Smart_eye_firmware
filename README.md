@@ -131,6 +131,9 @@ cd ~/Smart_eye_firmware/overlays
 make
 sudo make install
 sudo make enable
+sudo apt update
+sudo apt install -y cmake python3.11-venv python3-dev
+sudo apt install -y pkg-config libcairo2-dev
 sudo reboot
 ```
 
@@ -145,7 +148,7 @@ sudo python3 ~/Smart_eye_firmware/power_config.py
 ### 3. Install Python Dependencies
 
 ```bash
-cd ~/Smart_eye_firmware
+cd ~/Smart_eye_firmware 
 python3 -m venv venv --system-site-packages
 source venv/bin/activate
 pip install -r requirements.txt

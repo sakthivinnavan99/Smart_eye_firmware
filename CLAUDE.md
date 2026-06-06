@@ -26,8 +26,8 @@ sysfs/ioctl/subprocess calls (no heavy device libraries), plus one orchestrator:
 - `ButtonListener` — reads gpio-keys events from `/dev/input/eventN`; uses the
   `EVIOCGKEY` ioctl to read the **current** switch position at startup (not just edges).
   Keycodes: `0x100` = LANG_BTN (slide switch, en/hi), `0x101` = OCR_BTN.
-- `AudioPlayer` — queues WAV playback through `aplay`; toggles the MAX98357A amp via an
-  **inverted-logic** SD_MODE GPIO (AMP_SD LOW = amp ON). Runs on its own worker thread.
+- `AudioPlayer` — queues WAV playback through `aplay`; toggles the MAX98357A amp via
+  AMP_SD (GPIO4_A3=131): HIGH = amp ON, LOW = amp OFF (direct logic via R24 300K series resistor). Runs on its own worker thread.
   **Audio hardware:** Headphone output via ES8316 codec on I2C8-M2 (GPIO1_D6/D7, I2S0);
   speaker output via MAX98357A on I2S1-M0 (GPIO4_A1/A2/B2 for SCLK/LRCK/SDO1).
 - `BatteryGauge` — BQ27220 fuel gauge over `/dev/i2c-3` raw read/write. SOC is at register
@@ -64,9 +64,10 @@ Both cards coexist and can be tested with:
 # Headphone: mono files auto-convert to stereo via plughw
 aplay -D plughw:rockchipes8316,0 ~/Smart_eye_firmware/wav/English/battery_shutdown.wav
 
-# Speaker: enable GPIO4_A3 (AMP_SD, inverted-logic: 0=ON) then play
-sudo bash -c 'echo out > /sys/class/gpio/gpio131/direction; echo 0 > /sys/class/gpio/gpio131/value'
+# Speaker: enable GPIO4_A3 (AMP_SD HIGH=ON) then play
+sudo bash -c 'echo out > /sys/class/gpio/gpio131/direction; echo 1 > /sys/class/gpio/gpio131/value'
 aplay -D plughw:SmartEyeAudio,0 ~/Smart_eye_firmware/wav/English/battery_shutdown.wav
+sudo bash -c 'echo 0 > /sys/class/gpio/gpio131/value'
 ```
 
 **Critical hardware details:**
@@ -75,10 +76,11 @@ aplay -D plughw:SmartEyeAudio,0 ~/Smart_eye_firmware/wav/English/battery_shutdow
 - I2S1 speaker output uses `i2s-tx-route = <1 0 2 3>` to route stereo to SDO1 (GPIO4_B2 → MAX98357A DIN).
   The `i2s-lrck-gpio` property must be **disabled** (set to null) so LRCK is generated as an I2S signal,
   not monitored as GPIO — this is handled in the overlay as `i2s-lrck-gpio = <0x00>`.
-- I2S1 pinctrl uses only 4 groups (sclk/lrck/sdi0/sdo1), excluding i2s1m0-sdo0 which conflicts
-  with I2C6-M3 (fec80000.i2c). This conflict would prevent all pinctrl application.
-- AMP_SD (GPIO4_A3=131) is **inverted-logic:** LOW = amp ON, HIGH = amp OFF. The app controls this
-  via sysfs during audio playback to prevent DC on speaker outputs during BCLK-without-LRCK states.
+- I2S1 pinctrl uses only 3 groups (sclk/lrck/sdo1) — sdi0 (GPIO4_A5) and sdo0 (GPIO4_B0) are
+  excluded: sdi0 conflicts with UART3-M2 TX/RX, sdo0 conflicts with I2C6-M3. MAX98357A only
+  needs output pins.
+- AMP_SD (GPIO4_A3=131): **HIGH = amp ON, LOW = amp OFF** (direct via R24 300K, no BSS138 inverter).
+  The app controls this via sysfs to prevent DC on speaker outputs during BCLK-without-LRCK states.
 
 ## Things that will trip you up
 

@@ -91,7 +91,8 @@
 			};
 			audio-amp {
 				amp_sd_pin: amp-sd-pin {
-					rockchip,pins = <4 3 0 &pcfg_pull_none>;
+					/* pull-down keeps SD_MODE LOW (amp OFF) when GPIO is undriven */
+					rockchip,pins = <4 3 0 &pcfg_pull_down>;
 				};
 			};
 		};
@@ -213,13 +214,16 @@
 	 *   GPIO4_B2 (pin 138) = SDO1 (stereo audio data) via i2s1m0-sdo1
 	 *
 	 * Pin Conflict Workaround:
-	 *   The base DTB specifies all 10 i2s1m0 pin groups, but i2s1m0-sdo0
-	 *   (GPIO4_B0, pin 136) is claimed by I2C6-M3 (fec80000.i2c). When
-	 *   the kernel tries to apply all 10 groups, the conflict causes the
-	 *   entire pinctrl application to fail — ALL I2S1 pins revert to GPIO
-	 *   mode instead of I2S mode. Solution: override pinctrl-0 with only
-	 *   the 4 groups we actually use (sclk, lrck, sdi0, sdo1), avoiding
-	 *   the conflict and ensuring successful pinctrl application.
+	 *   The base DTB specifies all 10 i2s1m0 pin groups, but several
+	 *   conflict with other peripherals:
+	 *     - i2s1m0-sdo0 (GPIO4_B0) is claimed by I2C6-M3 (fec80000.i2c)
+	 *     - i2s1m0-sdi0 (GPIO4_A5) conflicts with UART3-M2 TX
+	 *     - i2s1m0-sdi1 (GPIO4_A6) conflicts with UART3-M2 RX
+	 *   When the kernel tries to apply conflicting groups, the entire
+	 *   pinctrl application fails — ALL I2S1 pins revert to GPIO mode.
+	 *   Solution: override pinctrl-0 with only the 3 output groups needed
+	 *   for the MAX98357A DAC (sclk, lrck, sdo1). SDI pins are input-only
+	 *   and not needed for speaker playback.
 	 *
 	 * LRCK Signal Generation Fix:
 	 *   The base DTB includes i2s-lrck-gpio which tells the RK3588 BSP
@@ -243,8 +247,9 @@
 		target = <&i2s1_8ch>;
 		__overlay__ {
 			status = "okay";
-			i2s-lrck-gpio = <0x00>;
+			/delete-property/ i2s-lrck-gpio;
 			rockchip,i2s-tx-route = <1 0 2 3>;
+			rockchip,i2s-rx-route = <0 1 2 3>;
 			rockchip,trcm-sync-tx-only;
 			pinctrl-names = "default";
 			pinctrl-0 = <&i2s1m0_sclk
@@ -254,23 +259,8 @@
 	};
 
 	/*
-	 * Speaker Sound Card (MAX98357A amplifier on I2S1)
-	 *
-	 * The MAX98357A is a Class-D digital amplifier (no codec, no register control).
-	 * It receives I2S audio directly on DIN (data input) and produces analog output.
-	 * SD_MODE (shutdown mode) is GPIO4_A3 (GPIO 131), with inverted logic: LOW=ON, HIGH=OFF.
-	 *
-	 * DC Protection:
-	 *   The application (AudioPlayer in main.py) controls GPIO 131 via sysfs:
-	 *   - Before playback: ensure amp is OFF (GPIO=1) to avoid DC at startup
-	 *   - During playback: turn amp ON (GPIO=0)
-	 *   - After playback: turn amp OFF immediately to avoid DC during BCLK free-run
-	 *
-	 * The trcm-sync-tx-only property (set in fragment@6) ensures BCLK and LRCK stop
-	 * together when the I2S stream ends, but the gap between stream stop and GPIO shutdown
-	 * can still produce DC transients. The app closes that window as much as possible.
-	 *
-	 * CPU (I2S1) is bitclock + frame master (BCLK and LRCK outputs from Radxa).
+	 * Speaker sound card via MAX98357A on I2S1.
+	 * CPU (I2S1) is bitclock + frame master.
 	 */
 	fragment@7 {
 		target-path = "/";

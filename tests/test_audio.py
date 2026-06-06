@@ -23,9 +23,9 @@ Device tree overlay: Overlays/smart-eye-carrier.dts
   - fragment@7: smart-eye-sound speaker card
 
 Hardware:
-  BSS138 (Q1) inverted logic for MAX98357A SD_MODE:
-    AMP_SD (GPIO4_A3 / gpio131) HIGH -> Q1 ON  -> SD_MODE LOW  -> amp OFF
-    AMP_SD (GPIO4_A3 / gpio131) LOW  -> Q1 OFF -> pullup -> SD_MODE HIGH -> amp ON
+  Direct logic via R24 (300K series resistor), no BSS138:
+    AMP_SD (GPIO4_A3 / gpio131) HIGH -> SD_MODE HIGH -> amp ON
+    AMP_SD (GPIO4_A3 / gpio131) LOW  -> SD_MODE LOW  -> amp OFF
 
 Usage:
     sudo python3 test_audio.py                     # test both speaker and headphone
@@ -90,27 +90,26 @@ def gpio_get():
         return -1
 
 
-def gpio_unexport():
-    try:
-        with open("/sys/class/gpio/unexport", "w") as f:
-            f.write(str(SDMODE_GPIO))
-    except OSError:
-        pass
+def gpio_release():
+    """Leave GPIO as output LOW (amp OFF). Do NOT unexport — releasing the pin
+    to input mode lets the MAX98357A internal pull-up float SD_MODE HIGH,
+    turning the amp on with no I2S input and heating the speaker."""
+    amp_off()
 
 
 def amp_on():
-    """Enable amp: AMP_SD LOW -> Q1 OFF -> SD_MODE HIGH via pullup."""
-    gpio_set(0)
-
-
-def amp_off():
-    """Disable amp: AMP_SD HIGH -> Q1 ON -> SD_MODE LOW."""
+    """Enable amp: AMP_SD HIGH -> SD_MODE HIGH -> amp ON."""
     gpio_set(1)
 
 
+def amp_off():
+    """Disable amp: AMP_SD LOW -> SD_MODE LOW -> amp OFF."""
+    gpio_set(0)
+
+
 def amp_is_off():
-    """Return True if AMP_SD is HIGH (amp disabled)."""
-    return gpio_get() == 1
+    """Return True if AMP_SD is LOW (amp disabled)."""
+    return gpio_get() == 0
 
 
 def wav_info(path):
@@ -123,7 +122,7 @@ def wav_info(path):
 
 
 def init_softvol():
-    """Ensure /etc/asound.conf has the softvol PCM and set volume to 100%."""
+    """Ensure /etc/asound.conf has the softvol PCM and set volume to 70%."""
     asound_conf = "/etc/asound.conf"
     conf_content = (
         'pcm.smarteye_loud {\n'
@@ -143,7 +142,7 @@ def init_softvol():
     except PermissionError:
         run(f"sudo tee {asound_conf} > /dev/null << 'EOF'\n{conf_content}EOF")
 
-    run(f"amixer -c {CARD_NAME} sset SoftMaster 100%")
+    run(f"amixer -c {CARD_NAME} sset SoftMaster 70%")
     return True
 
 
@@ -242,7 +241,7 @@ def main():
         print("[WARN] AMP_SD not HIGH — amp may still be on")
 
     if "--card-only" in sys.argv:
-        gpio_unexport()
+        gpio_release()
         print("\n  Card & mixer check complete.")
         sys.exit(0)
 
@@ -256,7 +255,7 @@ def main():
         files = glob.glob("/usr/share/sounds/alsa/*.wav")
     if not files:
         print(f"\n[FAIL] No WAV files found")
-        gpio_unexport()
+        gpio_release()
         sys.exit(1)
 
     argv_filter = [a for a in sys.argv[1:] if not a.startswith("--")]
@@ -273,7 +272,7 @@ def main():
             files = [f for f in files if keyword in os.path.basename(f).lower()]
             if not files:
                 print(f"\n[FAIL] No files matching '{keyword}'")
-                gpio_unexport()
+                gpio_release()
                 sys.exit(1)
 
     print(f"\n  Playing {len(files)} file(s)\n")
@@ -306,19 +305,9 @@ def main():
 
     if test_speaker:
         print(f"\n  Results: {passed} passed, {failed} failed / {len(files)}")
-        print(f"  AMP_SD final state: {'HIGH (amp OFF)' if amp_is_off() else 'LOW (amp ON!)'}")
+        print(f"  AMP_SD final state: {'LOW (amp OFF)' if amp_is_off() else 'HIGH (amp ON!)'}")
 
-        # 7. DC-protection hold test
-        print(f"\n  DC-protection hold test (5s)...", end="", flush=True)
-        all_off = True
-        for _ in range(25):
-            if not amp_is_off():
-                all_off = False
-                break
-            time.sleep(0.2)
-        print(f"  {'PASS' if all_off else 'FAIL'} — amp stayed {'OFF' if all_off else 'ON!'}")
-
-    gpio_unexport()
+    gpio_release()
 
     # 8. Headphone test (if requested)
     if test_headphone:

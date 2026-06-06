@@ -411,7 +411,7 @@ class ButtonListener:
 # ---------------------------------------------------------------------------
 #  Hardware abstraction: Audio playback via ALSA aplay
 # ---------------------------------------------------------------------------
-_SDMODE_GPIO = 131          # GPIO4_A3 -> BSS138 gate -> MAX98357A SD_MODE
+_SDMODE_GPIO = 131          # GPIO4_A3 -> R24 (300K) -> MAX98357A SD_MODE (HIGH=ON, LOW=OFF)
 
 SPEAKER_CARD = "SmartEyeAudio"
 SPEAKER_DEV  = "smarteye_loud"
@@ -445,9 +445,8 @@ def _sysfs_gpio_set(gpio, value):
 class AudioPlayer:
     """Audio playback via MAX98357A speaker amplifier.
 
-    BSS138 inverted logic for SD_MODE:
-      AMP_SD HIGH -> Q1 ON  -> SD_MODE LOW  -> amp OFF
-      AMP_SD LOW  -> Q1 OFF -> pullup -> SD_MODE HIGH -> amp ON
+    Direct logic (no BSS138): AMP_SD HIGH = SD_MODE HIGH = amp ON
+                               AMP_SD LOW  = SD_MODE LOW  = amp OFF
     """
 
     def __init__(self):
@@ -462,20 +461,20 @@ class AudioPlayer:
         log.info("Audio: speaker=card%s", self._spk_card)
 
     def _init_sdmode(self):
-        """Export AMP_SD GPIO; set HIGH at init (amp OFF)."""
+        """Export AMP_SD GPIO; set LOW at init (amp OFF)."""
         ok = _sysfs_gpio_export(_SDMODE_GPIO)
         if ok:
-            _sysfs_gpio_set(_SDMODE_GPIO, 1)
-            log.info("AMP_SD (gpio%d) HIGH — speaker amp OFF", _SDMODE_GPIO)
+            _sysfs_gpio_set(_SDMODE_GPIO, 0)
+            log.info("AMP_SD (gpio%d) LOW — speaker amp OFF", _SDMODE_GPIO)
         else:
             log.warning("Could not export AMP_SD gpio%d", _SDMODE_GPIO)
         return ok
 
     def _init_softvol(self):
-        """Set the speaker softvol to 100%."""
+        """Set the speaker softvol to 70% (prevents overdriving with 15dB HW gain)."""
         try:
             subprocess.run(
-                ["amixer", "-c", SPEAKER_CARD, "sset", "SoftMaster", "100%"],
+                ["amixer", "-c", SPEAKER_CARD, "sset", "SoftMaster", "70%"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
             )
         except Exception:
@@ -527,7 +526,7 @@ class AudioPlayer:
         dev = self._active_dev
         try:
             if self._sd_gpio_ok:
-                _sysfs_gpio_set(_SDMODE_GPIO, 0)   # AMP_SD LOW -> amp ON
+                _sysfs_gpio_set(_SDMODE_GPIO, 1)   # AMP_SD HIGH -> SD_MODE HIGH -> amp ON
                 time.sleep(0.01)
             self._proc = subprocess.Popen(
                 ["aplay", "-D", dev, "-q", path],
@@ -538,7 +537,7 @@ class AudioPlayer:
             log.warning("Audio playback error (%s): %s", dev, e)
         finally:
             if self._sd_gpio_ok:
-                _sysfs_gpio_set(_SDMODE_GPIO, 1)   # AMP_SD HIGH -> amp OFF
+                _sysfs_gpio_set(_SDMODE_GPIO, 0)   # AMP_SD LOW -> SD_MODE LOW -> amp OFF
             self._proc = None
 
     def stop(self):
@@ -546,7 +545,7 @@ class AudioPlayer:
         if self._proc:
             self._proc.terminate()
         if self._sd_gpio_ok:
-            _sysfs_gpio_set(_SDMODE_GPIO, 1)
+            _sysfs_gpio_set(_SDMODE_GPIO, 0)
 
 
 # ---------------------------------------------------------------------------
