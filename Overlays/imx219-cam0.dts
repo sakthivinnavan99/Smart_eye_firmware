@@ -1,0 +1,136 @@
+/dts-v1/;
+/plugin/;
+
+/*
+ * IMX219 (RPi Camera Module V2) on MIPI CSI-0
+ *
+ * Smart Eye carrier board wiring:
+ *   Camera connector J1 (DF37NC-30DS-0.4V) → MIPI CSI-0 (2-lane)
+ *     CAM0_D0N/P  (pins 23-24)   Data lane 0
+ *     CAM0_D1N/P  (pins 21-20)   Data lane 1
+ *     CAM0_C_N/P  (pins 27-26)   Clock lane
+ *   I2C7-M2  GPIO1_D2 SCL / GPIO1_D3 SDA  (via 1V8↔3V3 level shifter DMG1024UV)
+ *   MCLK     24 MHz from external oscillator Y1 (ECS-2018-240-BN-TR3)
+ *   PWDN     GPIO1_B2 (CSI_ENABLE, active-high power enable)
+ *   Power rails:
+ *     AVDD 2.8 V  — AP7331-28WG-7 LDO (U3)
+ *     DVDD 1.2 V  — PAM2301 boost (U4)
+ *     DOVDD 1.8 V — VCC_1V8_S0
+ *
+ * V4L2 device after boot:
+ *   /dev/video11   rkisp_mainpath  (used by main.py --camera)
+ *
+ * Test:
+ *   v4l2-ctl --device /dev/video11 --list-formats-ext
+ *   v4l2-ctl --device /dev/video11 --stream-mmap --stream-count=1
+ */
+
+/ {
+	metadata {
+		title       = "Smart Eye IMX219 Camera (CSI-0)";
+		compatible  = "radxa,cm5-lite-io";
+		category    = "camera";
+		exclusive   = "GPIO1_B2\0GPIO1_D2\0GPIO1_D3";
+		description = "Enable IMX219 (RPi Camera V2) on MIPI CSI-0.\n"
+		              "I2C7-M2 for control, GPIO1_B2 for power-enable.\n"
+		              "Appears as /dev/video11 (rkisp_mainpath).";
+	};
+
+	/*
+	 * I2C7-M2: camera control bus.
+	 * The base DTB already enables i2c7 with i2c7m2-xfer pinctrl on
+	 * GPIO1_D2/D3.  We only add the IMX219 child device here.
+	 * Carrier board has a DMG1024UV-7 dual-MOSFET level shifter between
+	 * the 1.8 V SoC I2C pins and the 3.3 V camera connector.
+	 */
+	fragment@0 {
+		target = <&i2c7>;
+		__overlay__ {
+			status = "okay";
+			#address-cells = <1>;
+			#size-cells    = <0>;
+
+			imx219: camera@10 {
+				compatible        = "sony,imx219";
+				reg               = <0x10>;
+				clocks            = <&cru CLK_MIPI_CAMARAOUT_M1>;
+				clock-names       = "xclk";
+				clock-frequency   = <24000000>;
+
+				/*
+				 * PWDN / power-enable: GPIO1_B2 (bank=1, B=1, pin=2
+				 * → 1*32 + 1*8 + 2 = 42).
+				 * AP7331 and PAM2301 are enabled when CSI_ENABLE goes HIGH.
+				 */
+				reset-gpios = <&gpio1 10 0>; /* GPIO1_B2, active-high */
+
+				port {
+					imx219_out: endpoint {
+						remote-endpoint = <&mipi_in_ucam0>;
+						data-lanes      = <1 2>;
+						clock-noncontinuous;
+						link-frequencies = /bits/ 64 <456000000>;
+					};
+				};
+			};
+		};
+	};
+
+	/* CSI-0 DPHY: receive side endpoint pointing to IMX219 */
+	fragment@1 {
+		target = <&mipi_camera_mux0>;
+		__overlay__ {
+			status = "okay";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells    = <0>;
+
+				port@0 {
+					reg = <0>;
+					mipi_in_ucam0: endpoint {
+						remote-endpoint = <&imx219_out>;
+						data-lanes      = <1 2>;
+					};
+				};
+			};
+		};
+	};
+
+	/* Enable MIPI CSI-0 DPHY */
+	fragment@2 {
+		target = <&csi2_dphy0>;
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	/* Enable ISP (Image Signal Processor) pipeline */
+	fragment@3 {
+		target = <&rkisp0>;
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	fragment@4 {
+		target = <&rkisp0_vir0>;
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	fragment@5 {
+		target = <&rkcif>;
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	fragment@6 {
+		target = <&rkcif_mipi_lvds>;
+		__overlay__ {
+			status = "okay";
+		};
+	};
+};

@@ -1,0 +1,77 @@
+/dts-v1/;
+/plugin/;
+
+/*
+ * FIQ Debugger re-enable on UART2-M0 (J6 debug port)
+ *
+ * Background:
+ *   The base DTB (rk3582-radxa-cm5-lite-io.dtb) was patched to disable the
+ *   FIQ debugger (rockchip,serial-id = <0xffffffff>, status = "disabled")
+ *   to avoid UART2 conflicts when UART2 was used for peripherals.
+ *
+ *   In the current Smart Eye design, UART2 is not used by any application
+ *   peripheral — it is exclusively the J6 debug port (UART2_TX_M0 on GPIO
+ *   and UART2_RX_M0).  Re-enabling the FIQ debugger provides a low-level
+ *   kernel serial console that remains accessible even when Linux is hung,
+ *   which is essential for field debugging of the assistive device.
+ *
+ * What FIQ debugger provides:
+ *   - Kernel-level serial console at 1.5 Mbaud on J6 (3-pin header)
+ *   - Works even during kernel panics, deadlocks, or OOM kills
+ *   - Access to kernel thread dumps, memory info, reboot trigger
+ *   - Type 'h' on serial console to see debugger commands
+ *
+ * Hardware:
+ *   J6  DebugPort connector (3-pin)
+ *     Pin 1 = GND
+ *     Pin 2 = UART2_RX_M0  (connect to TX of USB-UART adapter)
+ *     Pin 3 = UART2_TX_M0  (connect to RX of USB-UART adapter)
+ *   Baud rate: 1500000 (1.5 Mbaud)
+ *
+ * Host setup:
+ *   minicom -D /dev/ttyUSB0 -b 1500000
+ *   # or:
+ *   screen /dev/ttyUSB0 1500000
+ *
+ * Warning:
+ *   Do NOT connect an AJ-SR04M ultrasonic sensor to J6 while this overlay
+ *   is active — the 1.5 Mbaud U-Boot console output will corrupt UART2.
+ *   Ultrasonic sensors are on UART3 (J8) and UART6 (J9), not UART2 (J6).
+ */
+
+/ {
+	metadata {
+		title       = "Smart Eye FIQ Debugger (UART2-M0 / J6)";
+		compatible  = "radxa,cm5-lite-io";
+		category    = "misc";
+		description = "Re-enable Rockchip FIQ kernel debugger on UART2 (J6 debug port).\n"
+		              "Connect USB-UART adapter at 1500000 baud. Type 'h' for commands.";
+	};
+
+	/*
+	 * Re-enable the FIQ debugger node that was disabled in the base DTB
+	 * patch (BASE_DTB_PATCH.md).  Only UART2 is restored — no other
+	 * change to pinctrl or clocking is needed because UART2-M0 pinctrl
+	 * (GPIO3_B5 TX / GPIO3_B4 RX) is already configured in the base DTB.
+	 */
+	fragment@0 {
+		target-path = "/fiq-debugger";
+		__overlay__ {
+			rockchip,serial-id = <2>;     /* UART2 */
+			rockchip,baudrate  = <1500000>;
+			status             = "okay";
+		};
+	};
+
+	/*
+	 * Ensure UART2 itself is also active (base DTB may have it disabled
+	 * when the FIQ debugger owns it — the FIQ driver takes exclusive
+	 * control of the UART hardware, so the serial@ node should be off).
+	 */
+	fragment@1 {
+		target = <&uart2>;
+		__overlay__ {
+			status = "disabled"; /* FIQ debugger owns UART2 exclusively */
+		};
+	};
+};
