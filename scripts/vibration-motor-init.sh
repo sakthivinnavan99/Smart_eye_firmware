@@ -1,36 +1,46 @@
 #!/bin/bash
 #
-# Vibration motor init: immediately drive GPIO4_B3 low, then hand off to PWM.
+# Vibration motor init: hand GPIO0_C5 from GPIO sysfs to the PWM4 driver.
 #
-# GPIO4_B3 = bank 4, pin B3 = global GPIO 139 (128 + 8 + 3)
+# This service runs early in systemd (Before=sysinit.target) and does two things:
+#   1. Force the pin LOW via GPIO sysfs in case the initramfs hook left it exported.
+#   2. Export the PWM4 chip so the main app's VibrationMotor class can find it.
 #
-# Phase 1: Use GPIO sysfs to force pin low ASAP (kills the motor).
-# Phase 2: Set up PWM15 sysfs so userspace can control vibration intensity.
+# The boot vibration PATTERN is played by the initramfs hook
+# (scripts/initramfs-vibration-boot → /etc/initramfs-tools/scripts/init-bottom/)
+# which fires before systemd starts.  This service only handles the PWM handoff.
+#
+# GPIO0_C5 = bank 0, group C, pin 5 = global GPIO 21 (0*32 + 2*8 + 5)
+# PWM4-M0  = febd0000
 #
 # Install:
-#   sudo cp vibration-motor-init.sh /usr/local/bin/
+#   sudo cp scripts/vibration-motor-init.sh /usr/local/bin/
 #   sudo chmod +x /usr/local/bin/vibration-motor-init.sh
-#   sudo cp vibration-motor-init.service /etc/systemd/system/
+#   sudo cp services/vibration-motor-init.service /etc/systemd/system/
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable vibration-motor-init.service
 
-GPIO=139
-PWM_ADDR="febd0030"
+GPIO=21
+PWM_ADDR="febd0000"
+GPIO_PATH="/sys/class/gpio/gpio${GPIO}"
 
-# --- Phase 1: GPIO force-low (immediate) ---
-if [ ! -d /sys/class/gpio/gpio${GPIO} ]; then
+# ---------------------------------------------------------------------------
+# Phase 1: Ensure pin is LOW (idempotent — initramfs may have already done this)
+# ---------------------------------------------------------------------------
+if [ ! -d "$GPIO_PATH" ]; then
     echo $GPIO > /sys/class/gpio/export 2>/dev/null
     sleep 0.01
 fi
-echo out > /sys/class/gpio/gpio${GPIO}/direction
-echo 0   > /sys/class/gpio/gpio${GPIO}/value
-echo "vibration-motor-init: GPIO $GPIO forced LOW (motor OFF)"
+echo out > "$GPIO_PATH/direction" 2>/dev/null || true
+echo 0   > "$GPIO_PATH/value"    2>/dev/null || true
 
-# --- Phase 2: Hand off to PWM driver ---
-# Unexport GPIO so PWM pinctrl can claim the pin
-echo $GPIO > /sys/class/gpio/unexport 2>/dev/null
+# Unexport so PWM pinctrl can claim the pin
+echo $GPIO > /sys/class/gpio/unexport 2>/dev/null || true
 sleep 0.05
 
+# ---------------------------------------------------------------------------
+# Phase 2: Export PWM4 chip so VibrationMotor in main.py can find it
+# ---------------------------------------------------------------------------
 find_pwmchip() {
     for chip in /sys/class/pwm/pwmchip*; do
         if readlink -f "$chip/device" 2>/dev/null | grep -q "$PWM_ADDR"; then
@@ -43,10 +53,11 @@ find_pwmchip() {
 
 CHIP=$(find_pwmchip)
 if [ -z "$CHIP" ]; then
-    echo "vibration-motor-init: pwm15 ($PWM_ADDR) not found, staying in GPIO mode" >&2
+    echo "vibration-motor-init: PWM4 ($PWM_ADDR) not found — GPIO fallback will be used by main app" >&2
+    # Re-export as GPIO so VibrationMotor's GPIO fallback can use it
     echo $GPIO > /sys/class/gpio/export 2>/dev/null
-    echo out > /sys/class/gpio/gpio${GPIO}/direction
-    echo 0   > /sys/class/gpio/gpio${GPIO}/value
+    echo out > "$GPIO_PATH/direction"
+    echo 0   > "$GPIO_PATH/value"
     exit 0
 fi
 
@@ -56,7 +67,7 @@ if [ ! -d "$PWMPATH/pwm0" ]; then
     sleep 0.1
 fi
 
-echo 1000000 > "$PWMPATH/pwm0/period"
+echo 2000000 > "$PWMPATH/pwm0/period"     # 500 Hz default period
 echo 0       > "$PWMPATH/pwm0/duty_cycle"
 echo 1       > "$PWMPATH/pwm0/enable"
-echo "vibration-motor-init: $CHIP/pwm0 active, duty=0 (motor OFF via PWM)"
+echo "vibration-motor-init: $CHIP/pwm0 ready, duty=0 (motor OFF, PWM handed to app)"

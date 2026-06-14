@@ -4,25 +4,30 @@
 / {
 	metadata {
 		title = "Smart Eye Custom Carrier Board";
-		compatible = "radxa,cm5-io";
+		compatible = "radxa,cm5-lite-io";
 		category = "misc";
-		exclusive = "GPIO0_C5\0GPIO3_B7\0GPIO3_C0\0GPIO4_A4\0GPIO4_A5\0GPIO4_A6\0GPIO1_D1\0GPIO1_D0\0GPIO0_D3\0GPIO0_D0\0GPIO0_C7\0GPIO4_A3\0GPIO4_A1\0GPIO4_A2\0GPIO4_B2";
-		description = "Enable peripherals for Smart Eye custom carrier board:\n  - PWM4-M0 (GPIO0_C5) vibration motor\n  - I2C3-M1 (GPIO3_B7 SCL / GPIO3_C0 SDA) BQ27220 fuel gauge + BQ25895 charger\n  - GPIO4_A4 fuel gauge GPOUT interrupt\n  - UART3-M2 (GPIO4_A5 TX / GPIO4_A6 RX) front ultrasonic (US-front)\n  - UART6-M2 (GPIO1_D1 TX / GPIO1_D0 RX) bottom ultrasonic (US-down)\n  - GPIO0_D3 CHG_INT0_L charger interrupt\n  - GPIO0_D0 LANG_BTN, GPIO0_C7 OCR_BTN\n  - Speaker: MAX98357A on I2S1-M0 (SD_MODE via BSS138 on GPIO4_A3)\n  - Headphone: ES8316 codec on I2S0 + I2C8-M2 (hp-det-gpio jack detect)\n  - I2S1 trcm-sync-tx-only: BCLK+LRCLK stop together (DC protection)";
+		exclusive = "GPIO0_C5\0GPIO3_B7\0GPIO3_C0\0GPIO4_A4\0GPIO4_A5\0GPIO4_A6\0GPIO1_D1\0GPIO1_D0\0GPIO0_D3\0GPIO0_D0\0GPIO0_C7\0GPIO4_A3\0GPIO4_A1\0GPIO4_A2\0GPIO4_B2\0GPIO0_A0";
+		description = "Enable peripherals for Smart Eye custom carrier board:\n  - PWM4-M0 (GPIO0_C5) vibration motor\n  - I2C3-M1 (GPIO3_B7 SCL / GPIO3_C0 SDA) BQ27220 fuel gauge + BQ25895 charger\n  - GPIO4_A4 fuel gauge GPOUT interrupt\n  - UART3-M2 (GPIO4_A5 TX / GPIO4_A6 RX) front ultrasonic (US-front)\n  - UART6-M2 (GPIO1_D1 TX / GPIO1_D0 RX) bottom ultrasonic (US-down)\n  - GPIO0_D3 CHG_INT0_L charger interrupt\n  - GPIO0_D0 LANG_BTN, GPIO0_C7 OCR_BTN\n  - Speaker: MAX98357A on I2S1-M0 (SD_MODE via BSS138 on GPIO4_A3)\n  - Headphone: ES8316 codec on I2S0 + I2C8-M2 (hp-det-gpio jack detect)\n  - GPIO0_A0 HP_INT pull-up (ES8316 GPIO3 open-drain; R29=0R, no PCB pull-up)\n  - I2S1 trcm-sync-tx-only: BCLK+LRCLK stop together (DC protection)";
 	};
 
 	/*
 	 * Vibration motor on GPIO0_C5 (PWM4-M0, controller at 0xfebd0000).
 	 *
-	 * GPIO0_C5 muxes to PWM4 in M0 mode.  The PWM4 controller is the
-	 * first channel of the febd0000 PWM block (pwm4=febd0000, pwm5=febd0010,
-	 * pwm6=febd0020, pwm7=febd0030).  Use &pwm4 with &pwm4m0_pins.
+	 * GPIO0_C5 muxes to PWM4 in M0 mode (mux function 1).  The PWM4
+	 * controller is the first channel of the febd0000 PWM block
+	 * (pwm4=febd0000, pwm5=febd0010, pwm6=febd0020, pwm7=febd0030).
+	 *
+	 * We use a custom vib_pwm4m0 pin group (defined in fragment@2) instead
+	 * of the stock pwm4m0_pins so we can add pcfg_pull_down.  The pull-down
+	 * holds GPIO0_C5 LOW during early boot — before the PWM driver claims
+	 * the pin — preventing the motor from staying on until the OS is up.
 	 */
 	fragment@0 {
 		target = <&pwm4>;
 		__overlay__ {
 			status = "okay";
 			pinctrl-names = "default";
-			pinctrl-0 = <&pwm4m0_pins>;
+			pinctrl-0 = <&vib_pwm4m0>;
 		};
 	};
 
@@ -95,6 +100,27 @@
 					rockchip,pins = <4 3 0 &pcfg_pull_down>;
 				};
 			};
+			headphone-int {
+				hp_int_pull: hp-int-pull {
+					/*
+					 * GPIO0_A0 = HP_INT from ES8316 GPIO3.
+					 * ES8316 GPIO3 is open-drain: LOW=HP inserted, HI-Z=no HP.
+					 * Custom carrier board has no pull-up resistor (R29=0Ω series
+					 * only), so without bias-pull-up the line floats at ~0.88V
+					 * instead of 1.8V.  Enable the SoC internal ~50KΩ pull-up here
+					 * as a software workaround until a 10KΩ to VCC_1V8 is added.
+					 */
+					rockchip,pins = <0 0 0 &pcfg_pull_up>;
+				};
+			};
+			vibration {
+				vib_pwm4m0: vib-pwm4m0 {
+					/* GPIO0_C5 (bank=0, pin=21) in PWM4-M0 mux (func 1).
+					 * pull-down holds pin LOW during early boot so the
+					 * motor stays off before the PWM driver takes over. */
+					rockchip,pins = <0 21 1 &pcfg_pull_down>;
+				};
+			};
 		};
 	};
 
@@ -133,7 +159,7 @@
 			smart-eye-keys {
 				compatible = "gpio-keys";
 				pinctrl-names = "default";
-				pinctrl-0 = <&lang_btn &ocr_btn>;
+				pinctrl-0 = <&lang_btn &ocr_btn &hp_int_pull>;
 
 				lang-button {
 					label = "LANG_BTN";
@@ -195,6 +221,19 @@
 		target-path = "/es8316-sound";
 		__overlay__ {
 			status = "okay";
+			/*
+			 * rockchip,hp-det-gpio is intentionally omitted here.
+			 *
+			 * The rk-multicodecs driver accepts the property and claims
+			 * GPIO0_A0 via gpiod (blocking sysfs access), but never
+			 * actually registers a functioning GPIO IRQ — it declares
+			 * SW_HEADPHONE_INSERT capability on the input device yet
+			 * never fires the event on plug/unplug.
+			 *
+			 * Leaving GPIO0_A0 free allows audio-router.py to poll it
+			 * directly via /sys/class/gpio with a 500 ms debounce, which
+			 * is the only reliable detection method on this BSP.
+			 */
 		};
 	};
 

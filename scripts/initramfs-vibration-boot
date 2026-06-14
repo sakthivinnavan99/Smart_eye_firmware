@@ -1,0 +1,59 @@
+#!/bin/sh
+# initramfs init-bottom hook: Smart Eye boot vibration pattern
+#
+# Stage in the boot sequence:
+#   [kernel boot] → [initramfs init-premount] → [root fs mounted]
+#   → [THIS SCRIPT: init-bottom] → [exec /sbin/init (systemd)]
+#
+# At this stage the kernel has fully initialized all built-in drivers
+# (including RK3588S GPIO) but systemd and every userspace service are
+# still idle.  This is the earliest point a vibration pattern can fire
+# in software — equivalent to the Android bootloader haptic tick.
+#
+# Pattern (mobile phone style):  short · short · long
+#   60ms ON  80ms OFF  60ms ON  120ms OFF  280ms ON  ≈ 600ms total
+#
+# The pin is unexported at the end so the systemd PWM init service can
+# hand the pin to the PWM4 driver for the main app.
+#
+# Deploy on device:
+#   sudo cp scripts/initramfs-vibration-boot \
+#            /etc/initramfs-tools/scripts/init-bottom/smart-eye-vibration
+#   sudo chmod +x \
+#            /etc/initramfs-tools/scripts/init-bottom/smart-eye-vibration
+#   sudo update-initramfs -u
+#   sudo reboot
+
+PREREQS=""
+prereqs() { echo "$PREREQS"; }
+
+case "$1" in
+    prereqs) prereqs; exit 0 ;;
+esac
+
+VIB_GPIO=21                           # GPIO0_C5  (bank=0, C-group=2, pin=5 → 0*32+2*8+5=21)
+GPIO_SYS="/sys/class/gpio"
+GPIO_PATH="${GPIO_SYS}/gpio${VIB_GPIO}"
+
+# Export GPIO0_C5 and drive it LOW (motor off) before starting the pattern.
+# Even though the DTS pull-down already holds it low at the hardware level,
+# this guarantees a clean software-controlled state.
+echo ${VIB_GPIO} > "${GPIO_SYS}/export"  2>/dev/null || true
+echo out          > "${GPIO_PATH}/direction" 2>/dev/null || true
+echo 0            > "${GPIO_PATH}/value"
+
+# -- Mobile phone boot pattern ------------------------------------------------
+buzz() {
+    echo 1 > "${GPIO_PATH}/value"
+    sleep "0.$(printf '%03d' "$1")"   # arg is duration in ms (1–999)
+    echo 0 > "${GPIO_PATH}/value"
+}
+
+buzz  60 ; sleep 0.080
+buzz  60 ; sleep 0.120
+buzz 280
+# -----------------------------------------------------------------------------
+
+# Unexport so the PWM pinctrl can claim the pin when the PWM4 driver loads.
+# vibration-motor-init.service will complete the PWM handoff later.
+echo ${VIB_GPIO} > "${GPIO_SYS}/unexport" 2>/dev/null || true

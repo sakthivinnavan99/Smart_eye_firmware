@@ -1,61 +1,92 @@
 #!/bin/bash
 #
-# Configure U-Boot to drive GPIO4_B3 low at boot, turning off the
+# Configure U-Boot to drive GPIO0_C5 low at boot, turning off the
 # vibration motor before Linux loads.
 #
-# GPIO4_B3 = bank 4, offset 11 = global GPIO number 139
-# (bank4_base=128, B3=8+3=11, 128+11=139)
+# GPIO0_C5 = bank 0, group C, pin 5 = global GPIO 21 (0*32 + 2*8 + 5)
+# PWM4-M0 on this pin drives the vibration motor.
 #
-# The stock Radxa U-Boot supports the "gpio" and "preboot" commands.
-# We set the 'preboot' environment variable so U-Boot drives GPIO 139
-# low before loading the kernel.
+# U-Boot runs before the kernel's pinctrl/DTS takes effect, so without
+# this fix the motor stays ON from power-on until Linux initializes the
+# GPIO pull-down (several seconds into boot).
 #
-# Run this script ON THE BOARD (not on a Windows PC).
-#
-# Usage: sudo bash setup_uboot_gpio_fix.sh
+# Run this script ON THE BOARD:
+#   sudo bash scripts/setup_uboot_gpio_fix.sh
 
 set -e
 
+GPIO_NUM=21          # global GPIO number for GPIO0_C5
+GPIO_CMD="gpio clear ${GPIO_NUM}"   # U-Boot command: set pin LOW
+
 echo "=== Vibration Motor U-Boot GPIO Fix ==="
-echo ""
-echo "This will configure U-Boot to drive GPIO4_B3 (GPIO 139) low"
-echo "at every boot, turning off the vibration motor before Linux loads."
+echo "Target: GPIO0_C5 (global ${GPIO_NUM}) — drive LOW before kernel loads"
 echo ""
 
-# Method 1: fw_setenv (preferred -- writes directly to U-Boot env partition)
+# ── Method 1: fw_setenv (preferred) ─────────────────────────────────────────
 if command -v fw_setenv &>/dev/null; then
-    echo "Using fw_setenv to set preboot command..."
 
-    # Read existing preboot value (if any) to avoid clobbering it
+    # Verify fw_env.config exists and points to a real partition
+    if [ ! -f /etc/fw_env.config ]; then
+        echo "ERROR: /etc/fw_env.config not found."
+        echo "Create it for your eMMC layout (see Method 3 below) then re-run."
+        exit 1
+    fi
+
+    echo "Using fw_setenv (writes to U-Boot env partition)..."
+
     EXISTING=$(fw_printenv -n preboot 2>/dev/null || true)
 
-    if echo "$EXISTING" | grep -q "gpio clear 139"; then
-        echo "  Already configured. Nothing to do."
+    if echo "$EXISTING" | grep -q "${GPIO_CMD}"; then
+        echo "  Already configured (preboot already contains '${GPIO_CMD}'). Nothing to do."
         exit 0
     fi
 
     if [ -n "$EXISTING" ]; then
-        NEW_PREBOOT="gpio clear 139; ${EXISTING}"
+        NEW_PREBOOT="${GPIO_CMD}; ${EXISTING}"
     else
-        NEW_PREBOOT="gpio clear 139"
+        NEW_PREBOOT="${GPIO_CMD}"
     fi
 
     fw_setenv preboot "$NEW_PREBOOT"
-    echo "  Set preboot = \"$NEW_PREBOOT\""
+    echo "  preboot = \"$NEW_PREBOOT\""
     echo ""
-    echo "Done. Reboot to test: sudo reboot"
+    echo "Done. Reboot to verify: sudo reboot"
 
-# Method 2: guide user through U-Boot console
-else
-    echo "fw_setenv not found. Install it or set manually from U-Boot console."
-    echo ""
-    echo "Option A: Install u-boot-tools and re-run this script:"
+# ── Method 2: u-boot-tools not installed ────────────────────────────────────
+elif ! command -v fw_setenv &>/dev/null; then
+    echo "fw_setenv not found. Install u-boot-tools and re-run:"
     echo "  sudo apt-get install u-boot-tools"
-    echo "  sudo bash setup_uboot_gpio_fix.sh"
+    echo "  sudo bash scripts/setup_uboot_gpio_fix.sh"
     echo ""
-    echo "Option B: Set from U-Boot serial console (interrupt boot with Ctrl+C):"
-    echo "  => setenv preboot \"gpio clear 139\""
+    echo "If fw_env.config is missing, see Method 3 below."
+    echo ""
+    print_manual_steps
+fi
+
+# ── Method 3: Manual — U-Boot serial console ────────────────────────────────
+print_manual_steps() {
+    echo "─── Manual fix via U-Boot serial console ───────────────────────────"
+    echo "Connect a USB-UART adapter to the debug UART pins on the carrier board."
+    echo "Power on and interrupt U-Boot with any key within ~2 s."
+    echo ""
+    echo "Then at the => prompt, run:"
+    echo ""
+    echo "  => setenv preboot \"gpio clear ${GPIO_NUM}\""
     echo "  => saveenv"
     echo "  => boot"
     echo ""
-fi
+    echo "The 'gpio clear' command drives GPIO0_C5 LOW before the kernel loads,"
+    echo "cutting power to the vibration motor instantly on every subsequent boot."
+    echo "────────────────────────────────────────────────────────────────────"
+}
+
+# ── Verify fw_env.config for Radxa CM5 ──────────────────────────────────────
+# On Radxa CM5 (eMMC boot), U-Boot env is typically at:
+#   /dev/mmcblk0  offset 0x3F8000  size 0x8000  (two copies: 0x3F8000 + 0x400000)
+#
+# If /etc/fw_env.config is missing or wrong, create it:
+#   sudo tee /etc/fw_env.config <<'EOF'
+#   # Radxa CM5 eMMC — U-Boot environment (verify offsets with: strings /dev/mmcblk0 | grep preboot)
+#   /dev/mmcblk0    0x3F8000    0x8000
+#   /dev/mmcblk0    0x3FF8000   0x8000
+#   EOF

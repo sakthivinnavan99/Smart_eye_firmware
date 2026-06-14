@@ -6,7 +6,7 @@ stock Radxa CM5 base DTB. This conflicts with using UART2 for peripherals
 
 ## What was changed
 
-In `/usr/lib/linux-image-<KVER>/rockchip/rk3588s-radxa-cm5-io.dtb`:
+In `/usr/lib/linux-image-<KVER>/rockchip/rk3582-radxa-cm5-lite-io.dtb`:
 
 ```
 fiq-debugger {
@@ -26,8 +26,8 @@ fiq-debugger {
 
 ```bash
 KVER=$(uname -r)
-sudo cp /usr/lib/linux-image-${KVER}/rockchip/rk3588s-radxa-cm5-io.dtb.bak \
-        /usr/lib/linux-image-${KVER}/rockchip/rk3588s-radxa-cm5-io.dtb
+sudo cp /usr/lib/linux-image-${KVER}/rockchip/rk3582-radxa-cm5-lite-io.dtb.bak \
+        /usr/lib/linux-image-${KVER}/rockchip/rk3582-radxa-cm5-lite-io.dtb
 ```
 
 ## Warning

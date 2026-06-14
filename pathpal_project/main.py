@@ -4,13 +4,15 @@ Smart Eye Firmware - Main Application
 ======================================
 Assistive vision system for visually impaired users.
 
-Hardware platform: Radxa CM5 (RK3588S) on Smart Eye carrier board
+Hardware platform: Radxa CM5 Lite (RK3582) on Smart Eye carrier board
+  RK3582 is a binned RK3588S: same NPU architecture, so RKNN models built
+  with target_platform='rk3588' load fine via RKNNLite on this board.
   - Camera:      IMX219 via V4L2 (/dev/video11)
   - Inference:   YOLOv8n PathPal on RKNN NPU (models/pathpal/yolov8n_2912.rknn)
   - Audio:       MAX98357A on ALSA Smart-Eye-Audio (card 2)
   - Buttons:     LANG_BTN (GPIO0_D0), OCR_BTN (GPIO0_C7) via gpio-keys
   - Vibration:   PWM7 on GPIO4_B3 via sysfs
-  - Ultrasonic1: AJ-SR04M on UART3 (/dev/ttyS3) - front facing
+  - Ultrasonic1: AJ-SR04M on UART3-M2 (/dev/ttyS3) - front facing
   - Ultrasonic2: AJ-SR04M on UART6 (/dev/ttyS6) - bottom facing
   - Battery:     BQ27220 fuel gauge on I2C3 (0x55)
   - OCR:         RapidOCR (onnxruntime)
@@ -40,6 +42,19 @@ os.environ.setdefault("OMP_NUM_THREADS", "4")
 os.environ.setdefault("ORT_GLOBAL_THREAD_POOL_SIZE", "4")
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# RK3582 (Radxa CM5 Lite) shares the RK3588 NPU; RKNNLite loads rk3588 models
+# transparently on it. Normalize board names before passing to setup_model().
+_PLATFORM_ALIASES = {"rk3582": "rk3588", "rk3588s": "rk3588"}
+
+def _normalize_platform(p):
+    p = p.lower()
+    canonical = _PLATFORM_ALIASES.get(p, p)
+    if canonical != p:
+        logging.getLogger("smart-eye").info(
+            "Platform '%s' uses RK3588 NPU — normalised to '%s'", p, canonical
+        )
+    return canonical
 
 logging.basicConfig(
     level=logging.INFO,
@@ -125,17 +140,17 @@ def _apply_power_profile():
 # ---------------------------------------------------------------------------
 #  Hardware abstraction: Vibration motor (PWM sysfs with GPIO fallback)
 # ---------------------------------------------------------------------------
-_VIB_PWM_REG = "febd0030"
-_VIB_GPIO = 139                # GPIO4_B3 — shared with PWM7-M1
+_VIB_PWM_REG = "febd0000"
+_VIB_GPIO = 21                 # GPIO0_C5 — shared with PWM4-M0
 
 
 class VibrationMotor:
-    """Control vibration motor on GPIO4_B3.
+    """Control vibration motor on GPIO0_C5.
 
     Primary mode: PWM via sysfs (variable intensity).
     Fallback mode: GPIO on/off (if PWM chip unavailable).
 
-    The init service or a previous run may hold GPIO 139 via sysfs,
+    The init service or a previous run may hold GPIO 21 via sysfs,
     which prevents the PWM pinctrl from claiming the pin.  We release
     it first so the PWM controller can take over.
     """
@@ -416,6 +431,9 @@ _SDMODE_GPIO = 131          # GPIO4_A3 -> R24 (300K) -> MAX98357A SD_MODE (HIGH=
 SPEAKER_CARD = "SmartEyeAudio"
 SPEAKER_DEV  = "smarteye_loud"
 
+HEADPHONE_CARD = "rockchipes8316"
+HEADPHONE_DEV  = "plughw:rockchipes8316,0"   # plughw: mono WAVs auto-convert to stereo
+
 def _sysfs_gpio_export(gpio):
     """Export a GPIO via sysfs if not already exported."""
     path = f"/sys/class/gpio/gpio{gpio}"
@@ -454,11 +472,13 @@ class AudioPlayer:
         self._proc = None
         self._sd_gpio_ok = self._init_sdmode()
         self._spk_card = self._find_card(SPEAKER_CARD)
+        self._hp_card = self._find_card(HEADPHONE_CARD)
+        self.headphone = False
         self._init_softvol()
         self._queue = queue.Queue()
         self._thread = threading.Thread(target=self._worker, daemon=True)
         self._thread.start()
-        log.info("Audio: speaker=card%s", self._spk_card)
+        log.info("Audio: speaker=card%s headphone=card%s", self._spk_card, self._hp_card)
 
     def _init_sdmode(self):
         """Export AMP_SD GPIO; set LOW at init (amp OFF)."""
@@ -471,10 +491,10 @@ class AudioPlayer:
         return ok
 
     def _init_softvol(self):
-        """Set the speaker softvol to 70% (prevents overdriving with 15dB HW gain)."""
+        """Set the speaker softvol to 90% (prevents overdriving with 15dB HW gain)."""
         try:
             subprocess.run(
-                ["amixer", "-c", SPEAKER_CARD, "sset", "SoftMaster", "70%"],
+                ["amixer", "-c", SPEAKER_CARD, "sset", "SoftMaster", "90%"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
             )
         except Exception:
@@ -493,7 +513,20 @@ class AudioPlayer:
 
     @property
     def _active_dev(self):
+        if self.headphone and self._hp_card is not None:
+            return HEADPHONE_DEV
         return SPEAKER_DEV if self._spk_card is not None else "default"
+
+    def set_output(self, headphone):
+        """Route playback to headphone (ES8316) or speaker (MAX98357A)."""
+        if headphone and self._hp_card is None:
+            self._hp_card = self._find_card(HEADPHONE_CARD)  # card may appear late
+            if self._hp_card is None:
+                log.warning("Headphone card '%s' not found; staying on speaker", HEADPHONE_CARD)
+                return
+        if headphone != self.headphone:
+            self.headphone = headphone
+            log.info("Audio output -> %s", "headphone" if headphone else "speaker")
 
     def play(self, wav_path):
         if os.path.isfile(wav_path):
@@ -524,9 +557,10 @@ class AudioPlayer:
 
     def _play_sync(self, path):
         dev = self._active_dev
+        use_amp = self._sd_gpio_ok and dev != HEADPHONE_DEV   # amp stays OFF on headphone route
         try:
-            if self._sd_gpio_ok:
-                _sysfs_gpio_set(_SDMODE_GPIO, 1)   # AMP_SD HIGH -> SD_MODE HIGH -> amp ON
+            if use_amp:
+                _sysfs_gpio_set(_SDMODE_GPIO, 1)   # amp ON
                 time.sleep(0.01)
             self._proc = subprocess.Popen(
                 ["aplay", "-D", dev, "-q", path],
@@ -536,8 +570,8 @@ class AudioPlayer:
         except Exception as e:
             log.warning("Audio playback error (%s): %s", dev, e)
         finally:
-            if self._sd_gpio_ok:
-                _sysfs_gpio_set(_SDMODE_GPIO, 0)   # AMP_SD LOW -> SD_MODE LOW -> amp OFF
+            if use_amp:
+                _sysfs_gpio_set(_SDMODE_GPIO, 0)   # amp OFF
             self._proc = None
 
     def stop(self):
@@ -546,6 +580,89 @@ class AudioPlayer:
             self._proc.terminate()
         if self._sd_gpio_ok:
             _sysfs_gpio_set(_SDMODE_GPIO, 0)
+
+
+# ---------------------------------------------------------------------------
+#  Hardware abstraction: Headphone jack detection via SARADC channel 3
+# ---------------------------------------------------------------------------
+class HeadphoneDetector:
+    """Headphone insertion detection via the mic-line SARADC divider.
+
+    MICBIAS1 -2.2K(R35)- MIC_IN2P -10K(R36)- SARADC_VIN3 -10K(R37)- GND.
+    Empty jack reads ~3137 (MICBIAS through the divider); an inserted plug
+    loads the mic contact and the reading drops (~2460 measured; ~0 for a
+    3-pole plug that grounds the contact, or during a headset button press).
+    Requires ES8316 MICBIAS to be powered — with it off both states read ~0.
+    """
+
+    THRESHOLD = 2800          # below = inserted (midpoint of measured 2460/3137)
+    POLL_INTERVAL = 0.25
+    DEBOUNCE_READS = 2        # consecutive agreeing reads before switching
+
+    def __init__(self, on_change):
+        self._on_change = on_change
+        self._path = self._find_adc()
+        self._running = False
+        self._thread = None
+        self.inserted = None
+        if self._path:
+            log.info("HP-detect: %s (initial raw=%s)", self._path, self._read())
+        else:
+            log.warning("HP-detect: SARADC channel 3 not found — headphone switching disabled")
+
+    @staticmethod
+    def _find_adc():
+        base = "/sys/bus/iio/devices"
+        try:
+            for d in sorted(os.listdir(base)):
+                raw_f = os.path.join(base, d, "in_voltage3_raw")
+                try:
+                    with open(os.path.join(base, d, "name")) as f:
+                        if "saradc" in f.read() and os.path.isfile(raw_f):
+                            return raw_f
+                except OSError:
+                    continue
+        except OSError:
+            pass
+        return None
+
+    def _read(self):
+        try:
+            with open(self._path) as f:
+                return int(f.read().strip())
+        except (OSError, ValueError):
+            return None
+
+    def start(self):
+        if not self._path:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._poll, daemon=True)
+        self._thread.start()
+
+    def _poll(self):
+        candidate = None
+        agree = 0
+        while self._running:
+            raw = self._read()
+            if raw is not None:
+                state = raw < self.THRESHOLD
+                if state == candidate:
+                    agree += 1
+                else:
+                    candidate = state
+                    agree = 1
+                if agree >= self.DEBOUNCE_READS and state != self.inserted:
+                    self.inserted = state
+                    log.info("Headphone %s (adc=%d)", "inserted" if state else "removed", raw)
+                    try:
+                        self._on_change(state)
+                    except Exception as e:
+                        log.warning("HP-detect callback error: %s", e)
+            time.sleep(self.POLL_INTERVAL)
+
+    def stop(self):
+        self._running = False
 
 
 # ---------------------------------------------------------------------------
@@ -1046,6 +1163,8 @@ class SmartEyeApp:
 
         self.vibrator = VibrationMotor()
         self.audio = AudioPlayer()
+        self.hp_detect = HeadphoneDetector(self.audio.set_output)
+        self.hp_detect.start()
         self.gauge = BatteryGauge()
         self.us_front = UltrasonicSensor(
             getattr(self.args, "us_front_device", "/dev/ttyS2"), label="US-front"
@@ -1059,6 +1178,7 @@ class SmartEyeApp:
         self.detector = CameraDetector(
             model_path=args.model,
             device=args.camera,
+            target=_normalize_platform(args.platform),
             confidence=args.threshold,
             labels=self._load_labels(args.labels),
         )
@@ -1312,6 +1432,7 @@ class SmartEyeApp:
     def shutdown(self):
         self._running = False
         self.vibrator.cleanup()
+        self.hp_detect.stop()
         self.buttons.stop()
         self.audio.stop()
         self.detector.close()
@@ -1328,6 +1449,8 @@ def parse_args():
     p = argparse.ArgumentParser(description="Smart Eye assistive vision system")
     p.add_argument("--model", default=os.path.join(PROJECT_ROOT, "models/pathpal/model_v2_large.rknn"),
                    help="Path to RKNN model file")
+    p.add_argument("--platform", default="rk3582",
+                   help="Target SoC platform (rk3582/rk3588s map to rk3588 for RKNNLite, default: rk3582)")
     p.add_argument("--camera", default="/dev/video11",
                    help="V4L2 camera device")
     p.add_argument("--threshold", type=float, default=0.65,

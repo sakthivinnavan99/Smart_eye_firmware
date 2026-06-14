@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Firmware for the **Smart Eye** assistive-vision device: a Radxa CM5 (RK3588S) on a
+Firmware for the **Smart Eye** assistive-vision device: a Radxa CM5 Lite (RK3582) on a
 custom carrier board that helps visually-impaired users via real-time object detection
 (Indian currency, potholes, stairs), OCR + text-to-speech, ultrasonic obstacle sensing,
 and audio/haptic feedback. Everything runs **fully offline** on the device.
@@ -22,14 +22,27 @@ of **hardware-abstraction classes**, each wrapping one peripheral through raw Li
 sysfs/ioctl/subprocess calls (no heavy device libraries), plus one orchestrator:
 
 - `VibrationMotor` — PWM via sysfs (`/sys/class/pwm`) with a GPIO on/off fallback. It
-  deliberately *unexports* GPIO 139 first so the PWM pinctrl can claim the pin.
+  deliberately *unexports* GPIO 21 (GPIO0_C5, shared with PWM4-M0) first so the PWM
+  pinctrl can claim the pin.
 - `ButtonListener` — reads gpio-keys events from `/dev/input/eventN`; uses the
   `EVIOCGKEY` ioctl to read the **current** switch position at startup (not just edges).
   Keycodes: `0x100` = LANG_BTN (slide switch, en/hi), `0x101` = OCR_BTN.
-- `AudioPlayer` — queues WAV playback through `aplay`; toggles the MAX98357A amp via
-  AMP_SD (GPIO4_A3=131): HIGH = amp ON, LOW = amp OFF (direct logic via R24 300K series resistor). Runs on its own worker thread.
+- `AudioPlayer` — queues WAV playback through `aplay`; routes output to either
+  headphone (`plughw:rockchipes8316,0`) or speaker (`smarteye_loud` softvol device).
+  AMP_SD (GPIO4_A3=131) is only raised HIGH when playing through the speaker — it stays
+  LOW for headphone playback to prevent DC on the MAX98357A during BCLK-without-LRCK
+  states. `set_output(headphone: bool)` switches the active output; the change takes
+  effect on the next queued file, never mid-playback.
   **Audio hardware:** Headphone output via ES8316 codec on I2C8-M2 (GPIO1_D6/D7, I2S0);
   speaker output via MAX98357A on I2S1-M0 (GPIO4_A1/A2/B2 for SCLK/LRCK/SDO1).
+- `HeadphoneDetector` — detects headphone insertion via the SARADC VIN3 mic-line
+  voltage divider (MICBIAS1 → R35 2.2K → MIC_IN2P → R36 10K → SARADC_VIN3 → R37 10K →
+  GND). Polls IIO sysfs (`in_voltage3_raw`) every 250 ms with a 2-read debounce.
+  Threshold = 2800 raw counts (12-bit ADC, 1.8 V ref): below = inserted (~2460 measured);
+  above = removed (~3137 measured). Fires a callback (`audio.set_output`) on state change.
+  MICBIAS must be powered (ES8316 always keeps it on while the codec is active).
+  **Not** based on GPIO or ES8316 register 0x4D — those paths are dead on this carrier
+  (R33 NC isolates the jack switch from ES8316 GPIO1; HP_DET_L dead-ends on the PCB).
 - `BatteryGauge` — BQ27220 fuel gauge over `/dev/i2c-3` raw read/write. SOC is at register
   `0x2C` (not the usual `0x28`); capacity is estimated from a hardcoded `DESIGN_CAPACITY_MAH`.
 - `UltrasonicSensor` — AJ-SR04M over UART (Mode 4: write `0x01`, read `0xFF H L SUM`).
@@ -37,7 +50,9 @@ sysfs/ioctl/subprocess calls (no heavy device libraries), plus one orchestrator:
   `FAIL_RESET_THRESHOLD` no-responses. Pass `"none"`/`"off"` as the device to disable a sensor.
 - `CameraDetector` — V4L2 capture on a background thread that rotates every frame **90° CCW**
   before storing it, so detection and OCR both get correctly-oriented frames. Runs YOLOv8
-  RKNN inference via the `yolov8`/`py_utils` modules.
+  RKNN inference via the `yolov8`/`py_utils` modules. The `target` parameter is passed from
+  `args.platform` via `_normalize_platform()` — for the RK3582 this resolves to `'rk3588'`
+  before reaching `setup_model`.
 - `OCREngine` — RapidOCR (onnxruntime backend; no PaddlePaddle). One instance for all langs.
 - `Translator` — argostranslate en↔hi, offline; language packs must be pre-installed.
 - `SmartEyeApp` — wires everything together and runs the main loop: grab frame → detect →
@@ -45,13 +60,21 @@ sysfs/ioctl/subprocess calls (no heavy device libraries), plus one orchestrator:
   the button. Tunable interval/threshold/cooldown constants are class attributes at the top.
 
 **Threading model:** camera capture, audio playback, button polling, battery monitoring,
-and each OCR run are separate daemon threads. The main thread only does the detect loop.
+headphone detection, and each OCR run are separate daemon threads. The main thread only
+does the detect loop.
 
 **Inference pipeline:** `pathpal_project/yolov8.py` (`setup_model`, `post_process`, letterbox
 preprocessing) backed by `py_utils/rknn_executor.py` (RKNNLite on the NPU) with
 `onnx_executor.py` / `pytorch_executor.py` as alternate backends. `yolov8.py`'s `CLASSES`
 constant is the 80-class COCO list — it is **overridden at runtime** by `--labels`
 (`models/pathpal/labels.txt`, 12 classes). Don't rely on the COCO list for the real classes.
+
+**RK3582 / platform normalization:** `_normalize_platform()` at module level maps
+`'rk3582'` and `'rk3588s'` → `'rk3588'`. The RK3582 is a binned RK3588S with the same
+NPU ISA; RKNNLite loads `rk3588` models on it transparently. The `--platform` CLI arg
+defaults to `'rk3582'` and is normalised before being passed to `CameraDetector`.
+`convert.py` and `convert_yolov8.py` apply the same alias so the converters also accept
+`rk3582` on the command line.
 
 ## Audio Configuration (ES8316 Headphone + MAX98357A Speaker)
 
@@ -86,12 +109,13 @@ sudo bash -c 'echo 0 > /sys/class/gpio/gpio131/value'
 
 - **The app must run as root** (`sudo -E venv/bin/python3 ...`) — it writes governors,
   exports GPIOs, opens `/dev/i2c-*`, stops systemd services. Use `-E` to keep the venv.
-- **README values lag the code.** Defaults live in `parse_args()` and the `SmartEyeApp`
-  class constants, and they differ from the README tables (e.g. default model is
-  `model_v2_large.rknn` @ threshold `0.65`; `US_FRONT_THRESHOLD_CM = 60`,
-  `US_DOWN_THRESHOLD_CM = 130`). Treat `main.py` as the source of truth.
+- **`main.py` is the source of truth for all defaults.** `parse_args()` defaults:
+  model = `model_v2_large.rknn`, threshold = `0.65`, platform = `rk3582`,
+  us-front-device = `/dev/ttyS3` (UART3-M2), us-down-device = `/dev/ttyS6` (UART6-M2).
+  `SmartEyeApp` class-level thresholds: `US_FRONT_THRESHOLD_CM = 60`,
+  `US_DOWN_THRESHOLD_CM = 130`, `US_INTER_SENSOR_DELAY = 0.2 s`.
 - **Two overlay directories exist:** `Overlays/` (capital, with the `Makefile` and the
-  `rk3588-smart-eye-carrier.*` files that the build uses) and `overlays/` (lowercase).
+  `smart-eye-carrier.*` files that the build uses) and `overlays/` (lowercase).
   On case-insensitive macOS these may collide — check `git status` before assuming which
   file you edited. Build/install the device tree from the `Overlays/` Makefile:
   `make`, `sudo make install`, `sudo make enable`, then reboot. `make status` summarizes
@@ -102,6 +126,10 @@ sudo bash -c 'echo 0 > /sys/class/gpio/gpio131/value'
   back to Piper TTS.
 - **TTS** shells out to the bundled `piper/piper/piper` binary with per-language ONNX voice
   models, falling back to `espeak-ng`. Models are installed by `setup_tts.sh`.
+- **RKNN model conversion:** use `convert.py` or `convert_yolov8.py` on a host with
+  `rknn-toolkit2`. Both scripts accept `rk3582` on the CLI. The quantization `dataset.txt`
+  must list **image paths**, not class labels — confusing it with `labels.txt` produces a
+  broken or poorly-calibrated model.
 
 ## Commands (run on the device)
 
@@ -121,8 +149,9 @@ sudo python3 tests/battery_test.py
 # Device tree overlay (from Overlays/)
 make && sudo make install && sudo make enable && sudo reboot
 
-# Convert an ONNX YOLOv8 to RKNN (on a host with rknn-toolkit2)
-python3 pathpal_project/convert.py <onnx> rk3588 i8 <out.rknn>
+# Convert ONNX -> RKNN (on a host with rknn-toolkit2; rk3582 is accepted)
+python3 pathpal_project/convert.py model.onnx rk3582 i8 out.rknn
+python3 pathpal_project/convert_yolov8.py model.onnx rk3582 fp out.rknn
 ```
 
 There is no test runner or linter configured; `tests/` are standalone hardware scripts,
