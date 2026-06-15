@@ -1,0 +1,35 @@
+[Unit]
+Description=Smart Eye Assistive Vision System
+# sound.target: ES8316 / MAX98357A ALSA cards must be registered
+# vibration-motor-init.service: PWM4 must own GPIO0_C5 before main.py exports it
+# smart-eye-first-boot.service: BQ27220 must be configured before battery monitor starts
+After=multi-user.target sound.target vibration-motor-init.service smart-eye-first-boot.service
+Wants=sound.target vibration-motor-init.service
+
+[Service]
+Type=simple
+# Adjust WorkingDirectory and ExecStart to match your project location.
+# setup_device.sh writes these paths automatically based on where the repo lives.
+WorkingDirectory=/home/radxa/Smart_eye_firmware
+ExecStart=/home/radxa/Smart_eye_firmware/venv/bin/python3 pathpal_project/main.py
+
+# Must run as root: writes CPU governors, exports GPIOs, opens /dev/i2c-*,
+# opens /dev/input/eventN, stops system services, and uses RKNNLite NPU.
+# setup_device.sh installs this file as root-owned with no User= override.
+
+# Restart on crash but cap at 3 attempts per 30 s to avoid a crash loop
+# that would drain the battery through rapid NPU reinit cycles.
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=3
+StartLimitIntervalSec=30
+
+Environment=HOME=/home/radxa
+Environment=PYTHONUNBUFFERED=1
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=smart-eye
+
+[Install]
+WantedBy=multi-user.target

@@ -698,6 +698,15 @@ class BatteryGauge:
     REG_TTE      = 0x16
     REG_AVG_PWR  = 0x22
     REG_SOC      = 0x2C
+    REG_DESIGN_CAP = 0x3C   # standard command, mirrors the DM value
+    REG_OP_STATUS  = 0x3A
+
+    # Data Memory (CEDV Profile 1 subclass, big-endian 16-bit). The BQ27220
+    # keeps CFGUPDATE config in volatile RAM, so it reverts to ROM defaults
+    # whenever the battery is physically disconnected. ensure_design_capacity()
+    # re-applies these on boot when it detects the revert.
+    DM_FULL_CHARGE_CAP = 0x929D
+    DM_DESIGN_CAPACITY = 0x929F
 
     def __init__(self, bus=3, addr=0x55):
         self.bus = bus
@@ -709,6 +718,7 @@ class BatteryGauge:
             fcntl.ioctl(self.fd, I2C_SLAVE, addr)
         except OSError as e:
             log.warning("Cannot open BQ27220: %s", e)
+        self.ensure_design_capacity()
 
     def _rw(self, reg):
         if self.fd is None:
@@ -721,6 +731,92 @@ class BatteryGauge:
     def _rw_signed(self, reg):
         v = self._rw(reg)
         return v if v < 0x8000 else v - 0x10000
+
+    def _w(self, reg, data):
+        """Write a raw byte sequence [reg, *data] to the gauge."""
+        if self.fd is None:
+            return
+        with self._lock:
+            os.write(self.fd, bytes([reg] + list(data)))
+
+    def _ww(self, reg, val):
+        """Write a 16-bit little-endian word to a standard command register."""
+        self._w(reg, [val & 0xFF, (val >> 8) & 0xFF])
+
+    def ensure_design_capacity(self):
+        """Re-apply DesignCapacity/FCC if the gauge has reverted to ROM defaults.
+
+        The BQ27220 stores CFGUPDATE configuration in volatile RAM, so a
+        physical battery disconnect (full power-down/POR) wipes it back to the
+        factory default capacity. This re-programs it via the sealed-mode
+        CFGUPDATE sequence. It is idempotent and cheap on warm reboots: if the
+        gauge already reports the expected capacity it returns immediately
+        without touching flash. Needs root (the app already runs as root).
+        """
+        if self.fd is None:
+            return
+        try:
+            current = self._rw(self.REG_DESIGN_CAP)
+            if abs(current - self.DESIGN_CAPACITY_MAH) <= 100:
+                log.info("BQ27220 DesignCapacity OK (%d mAh)", current)
+                return
+            log.warning("BQ27220 DesignCapacity=%d mAh; reconfiguring to %d mAh",
+                        current, self.DESIGN_CAPACITY_MAH)
+            self._program_design_capacity()
+            new = self._rw(self.REG_DESIGN_CAP)
+            if abs(new - self.DESIGN_CAPACITY_MAH) <= 100:
+                log.info("BQ27220 reconfigured: DesignCapacity=%d mAh", new)
+            else:
+                log.warning("BQ27220 reconfigure may have failed: DesignCapacity=%d mAh", new)
+        except OSError as e:
+            log.warning("BQ27220 capacity reconfigure failed: %s", e)
+
+    def _op_status(self):
+        return self._rw(self.REG_OP_STATUS)
+
+    def _is_cfgupdate(self):
+        return bool(self._op_status() & (1 << 10))
+
+    def _write_dm_u16(self, dm_addr, value):
+        """Write a big-endian 16-bit value into Data Memory via the MAC block."""
+        payload = [dm_addr & 0xFF, (dm_addr >> 8) & 0xFF,
+                   (value >> 8) & 0xFF, value & 0xFF]
+        self._w(0x3E, payload)                 # SelectSubclass + data (auto-inc)
+        time.sleep(0.005)
+        cksum = (0xFF - (sum(payload) & 0xFF)) & 0xFF
+        self._w(0x60, [cksum, len(payload) + 2])  # MACDataSum + MACDataLen
+        time.sleep(0.02)
+
+    def _program_design_capacity(self):
+        """Unseal -> full access -> CFGUPDATE -> write FCC+DesignCap -> exit."""
+        # Unseal (default keys) then full access.
+        self._ww(0x00, 0x0414); time.sleep(0.01)
+        self._ww(0x00, 0x3672); time.sleep(0.01)
+        self._ww(0x00, 0xFFFF); time.sleep(0.01)
+        self._ww(0x00, 0xFFFF); time.sleep(0.01)
+
+        # Enter CFGUPDATE and wait for the flag.
+        self._ww(0x3E, 0x0090)
+        for _ in range(2000):
+            time.sleep(0.001)
+            if self._is_cfgupdate():
+                break
+        else:
+            log.warning("BQ27220 failed to enter CFGUPDATE")
+            return
+
+        self._write_dm_u16(self.DM_FULL_CHARGE_CAP, self.DESIGN_CAPACITY_MAH)
+        self._write_dm_u16(self.DM_DESIGN_CAPACITY, self.DESIGN_CAPACITY_MAH)
+
+        # Exit with reinit (commits RAM image) and wait for the flag to clear.
+        self._ww(0x3E, 0x0091)
+        time.sleep(2.0)
+        for _ in range(2000):
+            time.sleep(0.001)
+            if not self._is_cfgupdate():
+                break
+        self._ww(0x00, 0x0030)  # re-seal
+        time.sleep(0.1)
 
     @property
     def voltage_mv(self):

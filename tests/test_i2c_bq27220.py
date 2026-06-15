@@ -18,6 +18,9 @@ I2C_BUS = 3
 BQ27220_ADDR = 0x55
 I2C_SLAVE = 0x0703
 
+# BQ27220 standard command addresses (per TI SLUUBD4A / Flipper bq27220_reg.h).
+# StateOfCharge is 0x2C and StateOfHealth is 0x2E -- NOT 0x1C/0x20, which is
+# what produced the bogus "16248%" SoC / "124%" SoH in earlier runs.
 REGS = {
     "Control":         0x00,
     "Temperature":     0x06,
@@ -27,10 +30,9 @@ REGS = {
     "RemainingCap":    0x10,
     "FullChargeCap":   0x12,
     "AverageCurrent":  0x14,
-    "StandbyCurrent":  0x18,
-    "StateOfCharge":   0x1C,
-    "InternalTemp":    0x1E,
-    "StateOfHealth":   0x20,
+    "StateOfCharge":   0x2C,
+    "StateOfHealth":   0x2E,
+    "DesignCap":       0x3C,
 }
 
 GPIO_INT_CHIP = "gpiochip4"
@@ -164,6 +166,12 @@ def test_interpreted_values(results):
 
     if "FullChargeCap" in results:
         print("  Full Charge Cap:    {} mAh".format(results["FullChargeCap"]))
+
+    if "DesignCap" in results:
+        dc = results["DesignCap"]
+        print("  Design Capacity:    {} mAh".format(dc))
+        if 9000 <= dc <= 11000:
+            print("  [PASS] Design capacity matches 10000mAh config")
 
     if "StateOfHealth" in results:
         print("  State of Health:    {}%".format(results["StateOfHealth"]))

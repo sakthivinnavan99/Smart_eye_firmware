@@ -1,0 +1,18 @@
+[Unit]
+Description=Smart Eye First-Boot Power System Configuration (BQ25895 + BQ27220)
+# Run after I2C devices are settled — carrier overlay must be active so
+# /dev/i2c-3 exposes both the BQ25895 (0x6A) and BQ27220 (0x55).
+After=multi-user.target
+# Only run once: sentinel /etc/smart-eye-first-boot is created by
+# setup_device.sh and deleted on successful completion of this service.
+ConditionPathExists=/etc/smart-eye-first-boot
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/battery-mgr/first_boot_power_config.sh
+# Delete sentinel on success so this service is a true one-shot
+ExecStartPost=/bin/rm -f /etc/smart-eye-first-boot
+
+[Install]
+WantedBy=multi-user.target

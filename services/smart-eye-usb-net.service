@@ -1,0 +1,39 @@
+[Unit]
+Description=Smart Eye USB network static IP (usb0 192.168.2.100/24)
+# Must start after the Radxa NCM USB gadget service creates usb0.
+After=radxa-ncm@fc000000.usb.service network-pre.target
+Wants=radxa-ncm@fc000000.usb.service
+Before=network.target
+# Skip default systemd dependency chain so this can run very early
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# Wait up to 10 s for usb0 to appear after NCM gadget activates.
+# The gadget takes a moment to enumerate on the host side.
+ExecStartPre=/bin/sh -c '\
+    i=0; \
+    until ip link show usb0 >/dev/null 2>&1 || [ $i -ge 20 ]; do \
+        sleep 0.5; i=$((i+1)); \
+    done'
+
+ExecStart=/bin/sh -c '\
+    ip link set usb0 up && \
+    ip addr flush dev usb0 && \
+    ip addr add 192.168.2.100/24 dev usb0 && \
+    ip route replace default via 192.168.2.1 dev usb0'
+
+# Write DNS separately so it survives if NetworkManager tries to touch it
+ExecStartPost=/bin/sh -c 'echo "nameserver 8.8.8.8" > /etc/resolv.conf'
+
+ExecStop=/bin/sh -c '\
+    ip addr flush dev usb0 2>/dev/null || true; \
+    ip route del default via 192.168.2.1 dev usb0 2>/dev/null || true'
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

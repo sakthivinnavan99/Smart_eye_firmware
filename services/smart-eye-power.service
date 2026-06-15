@@ -1,0 +1,26 @@
+[Unit]
+Description=Smart Eye CPU Power Governor
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# Little cores A55 (cpu0-3): conservative governor
+ExecStart=/bin/bash -c 'for c in 0 1 2 3; do echo conservative > /sys/devices/system/cpu/cpu$c/cpufreq/scaling_governor 2>/dev/null || true; done'
+
+# Big cores A76 (cpu4-7): powersave
+ExecStart=/bin/bash -c 'for c in 4 5 6 7; do echo powersave > /sys/devices/system/cpu/cpu$c/cpufreq/scaling_governor 2>/dev/null || true; done'
+
+# GPU: minimum frequency (no display workload on Smart Eye)
+ExecStart=/bin/bash -c 'for g in /sys/class/devfreq/*gpu*; do f=$(head -1 "$g/available_frequencies" | cut -d" " -f1); echo userspace > "$g/governor"; echo "$f" > "$g/userspace/set_freq"; done 2>/dev/null || true'
+
+# HDMI / DP outputs: disable (no display connected)
+ExecStart=/bin/bash -c 'for d in /sys/class/drm/card*-HDMI* /sys/class/drm/card*-DP*; do [ -f "$d/enabled" ] && echo disabled > "$d/enabled"; done 2>/dev/null || true'
+
+# BQ25895 watchdog: disable so charge register settings survive
+# REG07 = 0x8F: WDT=OFF, EN_TERM=ON, CHG_TIMER=20h
+ExecStart=/bin/bash -c 'i2cset -y 3 0x6a 0x07 0x8f b 2>/dev/null || true'
+
+[Install]
+WantedBy=multi-user.target

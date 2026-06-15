@@ -2,12 +2,32 @@
 """
 BQ27220 Fuel Gauge Configuration for 10000mAh Battery
 
-Based on Flipper Zero's proven BQ27220 driver (skotopes/flipperzero_gauge_tool).
+Based on Flipper Zero's proven BQ27220 driver
+(flipperdevices/flipperzero-firmware, lib/drivers/bq27220*).
+
+The BQ27220 is a CEDV gauge. The only capacity parameters that exist in its
+Data Memory are FullChargeCapacity and DesignCapacity (both inside the
+"Gas Gauging / CEDV Profile 1" subclass). There is NO "Design Energy",
+"Terminate Voltage" or "Taper Rate" field on this part -- those belong to the
+Impedance Track family. Writing to those offsets here corrupts the CEDV
+profile coefficients (EMF/C0/R0/EDV...) and produces nonsense SOC after reinit.
+
+Data Memory addresses (CEDV Profile 1, big-endian 16-bit, verified against the
+Flipper bq27220_data_memory.h):
+  0x929B - GaugingConfig
+  0x929D - FullChargeCapacity (mAh)
+  0x929F - DesignCapacity     (mAh)
+  0x92A3 - EMF  (first CEDV coefficient -- do NOT overwrite)
+
+NOTE: for an accurate gauge on a new cell the full CEDV profile (EMF, C0, R0,
+EDV0/1/2, StartDOD table) should be regenerated with TI's GPCCEDV tool and
+loaded via bqStudio. This script only sets the capacity so reported mAh/SOC
+scale to a 10000mAh pack.
 
 Register map (BQ27220-specific):
   0x00 - Control
   0x3A - OperationStatus (CFGUPDATE flag is here, bit 10)
-  0x3C - DesignCapacity
+  0x3C - DesignCapacity (standard command, read-only mirror of DM)
   0x3E - SelectSubclass / MAC command
   0x40 - MACData (read back after MAC select)
   0x60 - MACDataSum (checksum)
@@ -30,17 +50,10 @@ ADDR = 0x55
 
 # Battery configuration
 DESIGN_CAPACITY_MAH   = 10000
-DESIGN_VOLTAGE_MV     = 3700
-DESIGN_ENERGY_CWH     = DESIGN_CAPACITY_MAH * DESIGN_VOLTAGE_MV // 10000  # 3700 cWh
-TERMINATE_VOLTAGE_MV  = 3000
-TAPER_CURRENT_MA      = 460
-TAPER_RATE            = DESIGN_CAPACITY_MAH * 10 // TAPER_CURRENT_MA  # 217
 
-# Data Memory addresses
-DM_DESIGN_CAPACITY    = 0x929C  # 2 bytes, mAh
-DM_DESIGN_ENERGY      = 0x929E  # 2 bytes, cWh
-DM_TERMINATE_VOLTAGE  = 0x92A0  # 2 bytes, mV
-DM_TAPER_RATE         = 0x92A3  # 2 bytes
+# Data Memory addresses (CEDV Profile 1 subclass, big-endian 16-bit)
+DM_FULL_CHARGE_CAP    = 0x929D  # 2 bytes, mAh
+DM_DESIGN_CAPACITY    = 0x929F  # 2 bytes, mAh
 
 # Delays (microseconds, matching Flipper driver)
 MAC_WRITE_DELAY    = 0.001     # 250us in Flipper, using 1ms for safety
@@ -232,10 +245,8 @@ def main():
     # --- Read current DM values ---
     print("\n[4] Current Data Memory")
     for addr, name in [
+        (DM_FULL_CHARGE_CAP, "Full Charge Capacity (mAh)"),
         (DM_DESIGN_CAPACITY, "Design Capacity (mAh)"),
-        (DM_DESIGN_ENERGY, "Design Energy (cWh)"),
-        (DM_TERMINATE_VOLTAGE, "Terminate Voltage (mV)"),
-        (DM_TAPER_RATE, "Taper Rate"),
     ]:
         v = g.read_dm_u16(addr)
         print(f"  {name:30s}: {v}")
@@ -255,10 +266,8 @@ def main():
     # --- Write parameters ---
     print("\n[6] Write Parameters")
     params = [
+        (DM_FULL_CHARGE_CAP, DESIGN_CAPACITY_MAH, "Full Charge Capacity"),
         (DM_DESIGN_CAPACITY, DESIGN_CAPACITY_MAH, "Design Capacity"),
-        (DM_DESIGN_ENERGY, DESIGN_ENERGY_CWH, "Design Energy"),
-        (DM_TERMINATE_VOLTAGE, TERMINATE_VOLTAGE_MV, "Terminate Voltage"),
-        (DM_TAPER_RATE, TAPER_RATE, "Taper Rate"),
     ]
     for addr, val, name in params:
         g.write_dm_u16(addr, val)

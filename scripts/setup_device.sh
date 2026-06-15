@@ -10,6 +10,7 @@
 #    --phase N     Run only phase N (1-15)
 #    --from N      Start from phase N and continue to end
 #    --skip-dl     Skip internet downloads (TTS models, argostranslate)
+#    --offline     No internet: skip apt update + all downloads (auto-detected)
 #    --no-reboot   Do not reboot automatically at the end
 #
 #  This script is idempotent — safe to re-run.
@@ -44,6 +45,7 @@ PHASE_ONLY=""
 FROM_PHASE=1
 SKIP_DL=0
 NO_REBOOT=0
+OFFLINE=0
 
 RED='\033[0;31m'; GRN='\033[0;32m'; YLW='\033[1;33m'
 BLU='\033[0;34m'; CYN='\033[0;36m'; BLD='\033[1m'; RST='\033[0m'
@@ -69,6 +71,7 @@ for arg in "$@"; do
         --phase=*)   PHASE_ONLY="${arg#--phase=}" ;;
         --from=*)    FROM_PHASE="${arg#--from=}" ;;
         --skip-dl)   SKIP_DL=1 ;;
+        --offline)   OFFLINE=1; SKIP_DL=1 ;;
         --no-reboot) NO_REBOOT=1 ;;
         --help|-h)
             sed -n '3,21p' "$0"
@@ -96,6 +99,21 @@ PYTHON="python3.11"
 mkdir -p "$(dirname "$LOG")"
 touch "$LOG"
 
+# ---------------------------------------------------------------------------
+#  Connectivity auto-detection
+#  Uses bash built-in TCP so no curl/wget needed at this early stage.
+# ---------------------------------------------------------------------------
+if [[ "$OFFLINE" -eq 0 ]]; then
+    if timeout 3 bash -c 'echo > /dev/tcp/8.8.8.8/53' 2>/dev/null; then
+        true  # online — leave OFFLINE=0
+    else
+        warn "No internet connection detected — switching to offline mode"
+        warn "Pass --offline explicitly to suppress this message."
+        OFFLINE=1
+        SKIP_DL=1
+    fi
+fi
+
 echo -e "\n${BLD}Smart Eye Device Setup${RST}  |  $(date)"
 echo -e "Project : ${PROJ}"
 echo -e "Log     : ${LOG}"
@@ -109,7 +127,11 @@ if ! skip_phase 1; then
     hdr 1 "System packages"
 
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq
+    if [[ "$OFFLINE" -eq 0 ]]; then
+        apt-get update -qq
+    else
+        info "Offline: skipping apt-get update (using cached package lists)"
+    fi
 
     PKGS=(
         # Build tools for DT overlay compilation
@@ -141,6 +163,10 @@ if ! skip_phase 1; then
 
     if [[ ${#MISSING[@]} -eq 0 ]]; then
         ok "All system packages already installed"
+    elif [[ "$OFFLINE" -eq 1 ]]; then
+        warn "Offline: cannot install missing packages: ${MISSING[*]}"
+        warn "Connect to internet then re-run phase 1:  sudo bash scripts/setup_device.sh --from=1 --phase=1"
+        warn "Or install manually: sudo apt-get install ${MISSING[*]}"
     else
         info "Installing: ${MISSING[*]}"
         apt-get install -y "${MISSING[@]}" 2>&1 | tee -a "$LOG"
@@ -373,42 +399,18 @@ if ! skip_phase 4; then
 
     # CPU governor service (persistent across reboots)
     CPU_SVC=/etc/systemd/system/smart-eye-power.service
-    if [[ ! -f "$CPU_SVC" ]]; then
-        info "Creating $CPU_SVC"
-        cat > "$CPU_SVC" <<'EOF'
-[Unit]
-Description=Smart Eye CPU Power Governor
-After=multi-user.target
+    SRC_CPU_SVC="$PROJ/services/smart-eye-power.service"
 
-[Service]
-Type=oneshot
-RemainAfterExit=yes
+    [[ -f "$SRC_CPU_SVC" ]] || die "Not found: $SRC_CPU_SVC"
 
-# Little cores A55 (cpu0-3): conservative governor
-ExecStart=/bin/bash -c 'for c in 0 1 2 3; do echo conservative > /sys/devices/system/cpu/cpu$c/cpufreq/scaling_governor 2>/dev/null || true; done'
-
-# Big cores A76 (cpu4-7): powersave
-ExecStart=/bin/bash -c 'for c in 4 5 6 7; do echo powersave > /sys/devices/system/cpu/cpu$c/cpufreq/scaling_governor 2>/dev/null || true; done'
-
-# GPU: minimum frequency (no display workload)
-ExecStart=/bin/bash -c 'for g in /sys/class/devfreq/*gpu*; do f=$(head -1 "$g/available_frequencies" | cut -d" " -f1); echo userspace > "$g/governor"; echo "$f" > "$g/userspace/set_freq"; done 2>/dev/null || true'
-
-# HDMI / DP outputs: disable (no display connected on Smart Eye)
-ExecStart=/bin/bash -c 'for d in /sys/class/drm/card*-HDMI* /sys/class/drm/card*-DP*; do [ -f "$d/enabled" ] && echo disabled > "$d/enabled"; done 2>/dev/null || true'
-
-# BQ25895 watchdog: disable so register settings survive across minutes
-# REG07 = 0x8F: WDT=OFF, EN_TERM=ON, CHG_TIMER=20h
-ExecStart=/bin/bash -c 'i2cset -y 3 0x6a 0x07 0x8f b 2>/dev/null || true'
-
-[Install]
-WantedBy=multi-user.target
-EOF
+    if [[ ! -f "$CPU_SVC" ]] || ! cmp -s "$SRC_CPU_SVC" "$CPU_SVC"; then
+        install -m 0644 "$SRC_CPU_SVC" "$CPU_SVC"
         systemctl daemon-reload
-        systemctl enable smart-eye-power.service
-        ok "smart-eye-power.service enabled"
+        ok "smart-eye-power.service installed from $SRC_CPU_SVC"
     else
-        ok "smart-eye-power.service already exists"
+        ok "smart-eye-power.service already up to date"
     fi
+    systemctl enable smart-eye-power.service
 
     # Kernel log verbosity (reduce eMMC writes)
     SYSCTL=/etc/sysctl.d/99-smart-eye.conf
@@ -800,7 +802,13 @@ if ! skip_phase 10; then
     hdr 10 "Python 3.11 venv + packages"
 
     VENV="$PROJ/venv"
-    PIP_OPTS="--no-cache-dir --quiet"
+    # Offline: keep pip cache so previously-downloaded wheels can be reused.
+    # Online: disable cache to avoid stale wheel collisions.
+    if [[ "$OFFLINE" -eq 1 ]]; then
+        PIP_OPTS="--quiet"
+    else
+        PIP_OPTS="--no-cache-dir --quiet"
+    fi
 
     # ── 9a: Verify Python 3.11 ──────────────────────────────────────────────
     info "[9a] Checking Python 3.11..."
@@ -844,7 +852,11 @@ if ! skip_phase 10; then
 
     # ── 9c: Bootstrap pip, setuptools, wheel ────────────────────────────────
     info "[9c] Upgrading pip / setuptools / wheel..."
-    "$PIP" install --upgrade pip setuptools wheel $PIP_OPTS 2>&1 | tee -a "$LOG"
+    if [[ "$OFFLINE" -eq 1 ]]; then
+        info "Offline: skipping pip/setuptools/wheel upgrade"
+    else
+        "$PIP" install --upgrade pip setuptools wheel $PIP_OPTS 2>&1 | tee -a "$LOG"
+    fi
     PIP_VER=$("$PIP" --version | awk '{print $2}')
     ok "pip $PIP_VER ready"
 
@@ -866,6 +878,8 @@ if ! skip_phase 10; then
         pkg_name="${pkg%%==*}"
         if "$PIP" show "$pkg_name" &>/dev/null; then
             ok "  $pkg_name already installed"
+        elif [[ "$OFFLINE" -eq 1 ]]; then
+            warn "  Offline: $pkg_name not installed — needs internet"
         else
             info "  Installing $pkg..."
             "$PIP" install "$pkg" $PIP_OPTS 2>&1 | tee -a "$LOG" || \
@@ -877,16 +891,25 @@ if ! skip_phase 10; then
     info "[9e] Installing requirements.txt (this can take several minutes)..."
     SPACE_BEFORE=$(df -BM "$PROJ" | awk 'NR==2{print $3}')
 
-    # Use --ignore-installed to avoid conflicts with system-site-packages
-    # Use --no-deps for packages that pull in conflicting trees (torch, etc.)
-    "$PIP" install \
-        -r "$PROJ/requirements.txt" \
-        $PIP_OPTS \
-        --ignore-installed \
-        2>&1 | tee -a "$LOG"
+    if [[ "$OFFLINE" -eq 1 ]]; then
+        info "Offline: installing from pip cache only (previously downloaded wheels)..."
+        "$PIP" install \
+            -r "$PROJ/requirements.txt" \
+            $PIP_OPTS \
+            --ignore-installed \
+            2>&1 | tee -a "$LOG" || \
+            warn "Some packages could not be installed offline — run with internet to complete"
+    else
+        # Use --ignore-installed to avoid conflicts with system-site-packages
+        "$PIP" install \
+            -r "$PROJ/requirements.txt" \
+            $PIP_OPTS \
+            --ignore-installed \
+            2>&1 | tee -a "$LOG"
+    fi
 
     SPACE_AFTER=$(df -BM "$PROJ" | awk 'NR==2{print $3}')
-    ok "requirements.txt installed  (disk: ${SPACE_BEFORE} → ${SPACE_AFTER})"
+    ok "requirements.txt done  (disk: ${SPACE_BEFORE} → ${SPACE_AFTER})"
 
     # ── 9f: Install RKNN Lite2 wheel ────────────────────────────────────────
     info "[9f] Installing RKNN Lite2 wheel..."
@@ -911,7 +934,11 @@ if ! skip_phase 10; then
     # ── 9g: Install rapidocr (OCR engine for text reading) ──────────────────
     info "[9g] Verifying rapidocr-onnxruntime..."
     if ! "$PIP" show rapidocr-onnxruntime &>/dev/null; then
-        "$PIP" install "rapidocr-onnxruntime==1.4.4" $PIP_OPTS 2>&1 | tee -a "$LOG"
+        if [[ "$OFFLINE" -eq 1 ]]; then
+            warn "Offline: rapidocr-onnxruntime not installed — needs internet"
+        else
+            "$PIP" install "rapidocr-onnxruntime==1.4.4" $PIP_OPTS 2>&1 | tee -a "$LOG"
+        fi
     fi
     ok "rapidocr-onnxruntime present"
 
@@ -1177,40 +1204,67 @@ if ! skip_phase 14; then
     # Write the first-boot shell wrapper
     cat > "$FIRST_BOOT_SH" <<EOF
 #!/bin/bash
-# One-shot: configure BQ25895 + BQ27220 on first boot after overlay is active.
+# One-shot: configure BQ25895 charger + BQ27220 fuel gauge on first boot.
+# Runs after the carrier overlay is active so I2C bus 3 exposes both ICs.
 LOG=/var/log/smart-eye-setup.log
-echo "\$(date '+%Y-%m-%d %H:%M:%S')  [FIRST-BOOT] Running power_config.py" >> "\$LOG"
+ts() { date '+%Y-%m-%d %H:%M:%S'; }
 
+echo "\$(ts)  [FIRST-BOOT] === Power system first-boot configuration ===" >> "\$LOG"
+
+# ── Verify both ICs are visible on I2C bus 3 ──────────────────────────────
 if ! i2cdetect -y 3 2>/dev/null | grep -q "6a"; then
-    echo "\$(date '+%Y-%m-%d %H:%M:%S')  [FIRST-BOOT] BQ25895 not found on i2c-3 — overlay may not be loaded" >> "\$LOG"
+    echo "\$(ts)  [FIRST-BOOT] ERROR: BQ25895 (0x6A) not found on i2c-3 — carrier overlay may not be active" >> "\$LOG"
     exit 1
 fi
+echo "\$(ts)  [FIRST-BOOT] BQ25895 found at i2c-3/0x6A" >> "\$LOG"
+
+if ! i2cdetect -y 3 2>/dev/null | grep -q "55"; then
+    echo "\$(ts)  [FIRST-BOOT] ERROR: BQ27220 (0x55) not found on i2c-3 — carrier overlay may not be active" >> "\$LOG"
+    exit 1
+fi
+echo "\$(ts)  [FIRST-BOOT] BQ27220 found at i2c-3/0x55" >> "\$LOG"
+
+# ── Configure BQ25895 charger registers ───────────────────────────────────
+# REG07 = 0x8F  WDT=OFF, EN_TERM=ON, CHG_TIMER=20h
+#   Disabling watchdog is critical: without it the IC resets charge params
+#   every 40 s, which can cause SYS voltage spikes under load.
+echo "\$(ts)  [FIRST-BOOT] Configuring BQ25895..." >> "\$LOG"
+i2cset -y 3 0x6a 0x07 0x8f b 2>&1 | tee -a "\$LOG"
+
+# REG09 = 0x4C  BATFET_DIS=0 (ON), BATFET_DLY=10s
+#   Ensures SYS rail is powered from battery; BATFET stays ON until an
+#   explicit ship-mode command (BATFET_DIS=1 written at poweroff).
+i2cset -y 3 0x6a 0x09 0x4c b 2>&1 | tee -a "\$LOG"
+
+# Verify key registers
+REG07=\$(i2cget -y 3 0x6a 0x07 b 2>/dev/null || echo "ERR")
+REG09=\$(i2cget -y 3 0x6a 0x09 b 2>/dev/null || echo "ERR")
+echo "\$(ts)  [FIRST-BOOT] BQ25895 REG07=\${REG07} (want 0x8f)  REG09=\${REG09} (want 0x4c)" >> "\$LOG"
+
+# ── Configure BQ27220 fuel gauge for 10000mAh pack ────────────────────────
+# Sets FullChargeCapacity and DesignCapacity so SOC/mAh readings scale
+# correctly to the 10000mAh pack on the Smart Eye carrier board.
+echo "\$(ts)  [FIRST-BOOT] Configuring BQ27220 via tests/config_fuel_gauge.py..." >> "\$LOG"
 
 cd ${PROJ}
-${PROJ}/venv/bin/python3 power_config.py 2>&1 | tee -a "\$LOG"
-echo "\$(date '+%Y-%m-%d %H:%M:%S')  [FIRST-BOOT] power_config.py complete" >> "\$LOG"
+${PROJ}/venv/bin/python3 tests/config_fuel_gauge.py 2>&1 | tee -a "\$LOG"
+FG_STATUS=\${PIPESTATUS[0]}
+
+if [[ \$FG_STATUS -eq 0 ]]; then
+    echo "\$(ts)  [FIRST-BOOT] BQ27220 configured OK" >> "\$LOG"
+else
+    echo "\$(ts)  [FIRST-BOOT] ERROR: config_fuel_gauge.py exited \$FG_STATUS" >> "\$LOG"
+    exit \$FG_STATUS
+fi
+
+echo "\$(ts)  [FIRST-BOOT] === Power system configuration complete ===" >> "\$LOG"
 EOF
     chmod 0755 "$FIRST_BOOT_SH"
 
-    # Write the one-shot service
-    cat > "$FIRST_BOOT_SVC" <<EOF
-[Unit]
-Description=Smart Eye First-Boot Power System Configuration
-# Run after I2C devices are settled (overlay must be active)
-After=network.target i2c.target multi-user.target
-# Only run once — sentinel file removed on success
-ConditionPathExists=${SENTINEL}
-
-[Service]
-Type=oneshot
-ExecStart=${FIRST_BOOT_SH}
-# Remove sentinel on success so this service never runs again
-ExecStartPost=/bin/rm -f ${SENTINEL}
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
+    # Install the one-shot service from the repo source file
+    SRC_FIRST_BOOT_SVC="$PROJ/services/smart-eye-first-boot.service"
+    [[ -f "$SRC_FIRST_BOOT_SVC" ]] || die "Not found: $SRC_FIRST_BOOT_SVC"
+    install -m 0644 "$SRC_FIRST_BOOT_SVC" "$FIRST_BOOT_SVC"
 
     # Create sentinel so the service fires on the first boot after reboot
     touch "$SENTINEL"
@@ -1316,9 +1370,9 @@ echo ""
 echo -e "What happens on first reboot:"
 echo -e "  1. All overlays load → I2C3, UARTs, PWM4, I2S1, IMX219 camera, FIQ debugger"
 echo -e "  2. smart-eye-usb-net.service → usb0 at 192.168.2.100 (SSH access)"
-echo -e "  3. smart-eye-first-boot.service runs power_config.py"
-echo -e "     → BQ25895 charger registers set (4.208 V, 2 A charge, WDT off)"
-echo -e "     → BQ27220 fuel gauge programmed for 10000 mAh"
+echo -e "  3. smart-eye-first-boot.service runs first_boot_power_config.sh"
+echo -e "     → BQ25895: REG07=0x8F (WDT off), REG09=0x4C (BATFET ON)"
+echo -e "     → BQ27220: tests/config_fuel_gauge.py sets 10000mAh capacity"
 echo -e "  4. smart-eye-power.service sets CPU governors + disables HDMI"
 echo -e "  5. vibration-motor-init.service hands GPIO0_C5 to PWM4 driver"
 echo -e "  6. smart-eye.service starts the main app (auto on every boot)"
@@ -1334,8 +1388,8 @@ echo ""
 echo -e "FIQ debugger (kernel serial console on J6):"
 echo -e "  Connect USB-UART adapter at 1500000 baud, type 'h' for commands"
 echo ""
-echo -e "Manual power system check (after reboot):"
-echo -e "  sudo python3 ${PROJ}/power_config.py --status"
+echo -e "Manual fuel gauge check (after reboot):"
+echo -e "  sudo python3 ${PROJ}/tests/config_fuel_gauge.py"
 echo ""
 
 log "Setup complete. Rebooting..."
