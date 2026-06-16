@@ -275,101 +275,248 @@ if ! skip_phase 3; then
     # over our local DTS because it is tuned to the exact BSP kernel version.
     # If not present, we compile Overlays/imx219-cam0.dts ourselves.
 
-    info "Setting up IMX219 camera overlay (CSI-0)..."
+#     info "Setting up IMX219 camera overlay (CSI-0)..."
 
-    CAMERA_DTBO="imx219-cam0.dtbo"
-    CAMERA_BOOT="$BOOT_DTBO_DIR/$CAMERA_DTBO"
+#     CAMERA_DTBO="imx219-cam0.dtbo"
+#     CAMERA_BOOT="$BOOT_DTBO_DIR/$CAMERA_DTBO"
 
-    # Search for a pre-built Radxa overlay first (several known names)
-    CAMERA_SRC=""
-    for candidate in \
-        "${OVERLAY_KDIR}/rk3588-camera-imx219-cam0.dtbo" \
-        "${OVERLAY_KDIR}/rk3588s-camera-imx219-cam0.dtbo" \
-        "${OVERLAY_KDIR}/radxa-camera-imx219-cam0.dtbo" \
-        "/usr/share/dtbs/$(uname -r)/rockchip/overlays/rk3588-camera-imx219-cam0.dtbo" \
-        "$BOOT_DTBO_DIR/rk3588-camera-imx219-cam0.dtbo"; do
-        if [[ -f "$candidate" ]]; then
-            CAMERA_SRC="$candidate"
-            CAMERA_DTBO=$(basename "$candidate")
-            CAMERA_BOOT="$BOOT_DTBO_DIR/$CAMERA_DTBO"
-            ok "  Found Radxa camera overlay: $CAMERA_SRC"
-            break
-        fi
-    done
+#     # Search for a pre-built Radxa overlay first (several known names)
+#     CAMERA_SRC=""
+#     for candidate in \
+#         "${OVERLAY_KDIR}/rk3588-camera-imx219-cam0.dtbo" \
+#         "${OVERLAY_KDIR}/rk3588s-camera-imx219-cam0.dtbo" \
+#         "${OVERLAY_KDIR}/radxa-camera-imx219-cam0.dtbo" \
+#         "/usr/share/dtbs/$(uname -r)/rockchip/overlays/rk3588-camera-imx219-cam0.dtbo" \
+#         "$BOOT_DTBO_DIR/rk3588-camera-imx219-cam0.dtbo"; do
+#         if [[ -f "$candidate" ]]; then
+#             CAMERA_SRC="$candidate"
+#             CAMERA_DTBO=$(basename "$candidate")
+#             CAMERA_BOOT="$BOOT_DTBO_DIR/$CAMERA_DTBO"
+#             ok "  Found Radxa camera overlay: $CAMERA_SRC"
+#             break
+#         fi
+#     done
 
-    # Fall back to our local DTS
-    if [[ -z "$CAMERA_SRC" ]]; then
-        LOCAL_DTS="$PROJ/Overlays/imx219-cam0.dts"
-        LOCAL_DTBO="$PROJ/Overlays/imx219-cam0.dtbo"
-        if [[ -f "$LOCAL_DTS" ]]; then
-            info "  Compiling $LOCAL_DTS..."
-            dtc -@ -I dts -O dtb -o "$LOCAL_DTBO" "$LOCAL_DTS" 2>&1 | tee -a "$LOG"
-            CAMERA_SRC="$LOCAL_DTBO"
-            ok "  Compiled local camera overlay"
-        else
-            warn "  Camera overlay DTS not found: $LOCAL_DTS"
-            CAMERA_SRC=""
-        fi
-    fi
+#     # Fall back to our local DTS
+#     if [[ -z "$CAMERA_SRC" ]]; then
+#         LOCAL_DTS="$PROJ/Overlays/imx219-cam0.dts"
+#         LOCAL_DTBO="$PROJ/Overlays/imx219-cam0.dtbo"
+#         if [[ -f "$LOCAL_DTS" ]]; then
+#             info "  Compiling $LOCAL_DTS..."
+#             dtc -@ -I dts -O dtb -o "$LOCAL_DTBO" "$LOCAL_DTS" 2>&1 | tee -a "$LOG"
+#             CAMERA_SRC="$LOCAL_DTBO"
+#             ok "  Compiled local camera overlay"
+#         else
+#             warn "  Camera overlay DTS not found: $LOCAL_DTS"
+#             CAMERA_SRC=""
+#         fi
+#     fi
 
-    if [[ -n "$CAMERA_SRC" ]]; then
-        if [[ ! -f "$CAMERA_BOOT" ]]; then
-            cp "$CAMERA_SRC" "$CAMERA_BOOT"
-        fi
-        if [[ -f "$BOOT_DTBO_DIR/managed.list" ]]; then
-            grep -qF "$CAMERA_DTBO" "$BOOT_DTBO_DIR/managed.list" || \
-                echo "$CAMERA_DTBO" >> "$BOOT_DTBO_DIR/managed.list"
-        else
-            echo "$CAMERA_DTBO" > "$BOOT_DTBO_DIR/managed.list"
-        fi
-        ok "Camera overlay enabled: $CAMERA_DTBO"
-        info "After reboot, verify with: v4l2-ctl --device /dev/video11 --list-formats-ext"
-    fi
+#     if [[ -n "$CAMERA_SRC" ]]; then
+#         if [[ ! -f "$CAMERA_BOOT" ]]; then
+#             cp "$CAMERA_SRC" "$CAMERA_BOOT"
+#         fi
+#         if [[ -f "$BOOT_DTBO_DIR/managed.list" ]]; then
+#             grep -qF "$CAMERA_DTBO" "$BOOT_DTBO_DIR/managed.list" || \
+#                 echo "$CAMERA_DTBO" >> "$BOOT_DTBO_DIR/managed.list"
+#         else
+#             echo "$CAMERA_DTBO" > "$BOOT_DTBO_DIR/managed.list"
+#         fi
+#         ok "Camera overlay enabled: $CAMERA_DTBO"
+#         info "After reboot, verify with: v4l2-ctl --device /dev/video11 --list-formats-ext"
+#     fi
 
-    # ── FIQ debugger overlay: re-enable UART2 kernel console on J6 ─────────
+#     # ── FIQ debugger overlay: re-enable UART2 kernel console on J6 ─────────
+#     #
+#     # The base DTB was patched to disable the FIQ debugger (BASE_DTB_PATCH.md).
+#     # This overlay restores it so J6 (UART2-M0) provides a kernel-level serial
+#     # console at 1.5 Mbaud — accessible even during kernel panics.
+#     # UART2 is not used by any Smart Eye peripheral (sensors are on UART3/UART6).
+
+#     info "Setting up FIQ debugger overlay (UART2 / J6)..."
+
+#     FIQ_DTS="$PROJ/Overlays/fiq-debugger-uart2.dts"
+#     FIQ_DTBO_NAME="fiq-debugger-uart2.dtbo"
+#     FIQ_DTBO="$PROJ/Overlays/$FIQ_DTBO_NAME"
+#     FIQ_BOOT="$BOOT_DTBO_DIR/$FIQ_DTBO_NAME"
+
+#     if [[ -f "$FIQ_DTS" ]]; then
+#         dtc -@ -I dts -O dtb -o "$FIQ_DTBO" "$FIQ_DTS" 2>&1 | tee -a "$LOG"
+
+#         if [[ ! -f "$FIQ_BOOT" ]]; then
+#             cp "$FIQ_DTBO" "$FIQ_BOOT"
+#         else
+#             # Replace if source is newer
+#             [[ "$FIQ_DTS" -nt "$FIQ_BOOT" ]] && cp "$FIQ_DTBO" "$FIQ_BOOT"
+#         fi
+
+#         if [[ -f "$BOOT_DTBO_DIR/managed.list" ]]; then
+#             grep -qF "$FIQ_DTBO_NAME" "$BOOT_DTBO_DIR/managed.list" || \
+#                 echo "$FIQ_DTBO_NAME" >> "$BOOT_DTBO_DIR/managed.list"
+#         else
+#             echo "$FIQ_DTBO_NAME" > "$BOOT_DTBO_DIR/managed.list"
+#         fi
+#         ok "FIQ debugger overlay enabled: $FIQ_DTBO_NAME"
+#         info "After reboot, connect USB-UART to J6 at 1500000 baud (type 'h' for commands)"
+#     else
+#         warn "FIQ debugger DTS not found: $FIQ_DTS — skipping"
+#     fi
+
+#     # Print final managed.list so it's visible in the log
+#     if [[ -f "$BOOT_DTBO_DIR/managed.list" ]]; then
+#         info "Active overlays in $BOOT_DTBO_DIR/managed.list:"
+#         while IFS= read -r line; do
+#             info "  $line"
+#         done < "$BOOT_DTBO_DIR/managed.list"
+#     fi
+
+    # ── Base DTB patches: USB Type-C fix ─────────────────────────────────────
     #
-    # The base DTB was patched to disable the FIQ debugger (BASE_DTB_PATCH.md).
-    # This overlay restores it so J6 (UART2-M0) provides a kernel-level serial
-    # console at 1.5 Mbaud — accessible even during kernel panics.
-    # UART2 is not used by any Smart Eye peripheral (sensors are on UART3/UART6).
+    # The stock rk3588s-radxa-cm5-io.dtb has two incompatibilities with the
+    # Smart Eye carrier that block USB Type-C detection:
+    #
+    #  (a) fusb302@22 vbus-supply → vbus5v0_typec regulator, which uses
+    #      GPIO4_A5 as its enable GPIO. The carrier claims GPIO4_A5 for
+    #      UART3-M2 (front ultrasonic). The regulator loops in EPROBE_DEFER
+    #      indefinitely, preventing fusb302 from probing, so DWC3 never
+    #      receives VBUS events and USB is never detected.
+    #      Fix: remove vbus-supply from fusb302@22. The TPS22916 ON pin is
+    #      hardwired to VCC5V0_SYS so no GPIO enable is needed.
+    #
+    #  (b) Three TCPM port endpoint dependencies create circular probe
+    #      deadlocks with the USBDP PHY (fed80000.phy):
+    #        • DP alt-mode mux (connector port@1 → PHY endpoint@1)
+    #        • USB orientation switch (connector port@0 → PHY endpoint@0)
+    #        • USB role switch (fusb302 top-level port@0 → DWC3 fc000000.usb)
+    #      None are needed: no DisplayPort hardware, PHY handles orientation
+    #      internally, DWC3 is already forced to peripheral mode.
+    #      Fix: remove all three port/endpoint blocks from fusb302@22.
+    #
+    # See Overlays/BASE_DTB_PATCH.md for full details and manual steps.
 
-    info "Setting up FIQ debugger overlay (UART2 / J6)..."
+    info "Patching base DTB for USB Type-C (fusb302 vbus-supply + TCPM deadlocks)..."
 
-    FIQ_DTS="$PROJ/Overlays/fiq-debugger-uart2.dts"
-    FIQ_DTBO_NAME="fiq-debugger-uart2.dtbo"
-    FIQ_DTBO="$PROJ/Overlays/$FIQ_DTBO_NAME"
-    FIQ_BOOT="$BOOT_DTBO_DIR/$FIQ_DTBO_NAME"
+    KVER=$(uname -r)
+    BASE_DTB="/usr/lib/linux-image-${KVER}/rockchip/rk3588s-radxa-cm5-io.dtb"
+    BASE_DTB_BAK="${BASE_DTB}.bak.usb"
 
-    if [[ -f "$FIQ_DTS" ]]; then
-        dtc -@ -I dts -O dtb -o "$FIQ_DTBO" "$FIQ_DTS" 2>&1 | tee -a "$LOG"
-
-        if [[ ! -f "$FIQ_BOOT" ]]; then
-            cp "$FIQ_DTBO" "$FIQ_BOOT"
-        else
-            # Replace if source is newer
-            [[ "$FIQ_DTS" -nt "$FIQ_BOOT" ]] && cp "$FIQ_DTBO" "$FIQ_BOOT"
-        fi
-
-        if [[ -f "$BOOT_DTBO_DIR/managed.list" ]]; then
-            grep -qF "$FIQ_DTBO_NAME" "$BOOT_DTBO_DIR/managed.list" || \
-                echo "$FIQ_DTBO_NAME" >> "$BOOT_DTBO_DIR/managed.list"
-        else
-            echo "$FIQ_DTBO_NAME" > "$BOOT_DTBO_DIR/managed.list"
-        fi
-        ok "FIQ debugger overlay enabled: $FIQ_DTBO_NAME"
-        info "After reboot, connect USB-UART to J6 at 1500000 baud (type 'h' for commands)"
+    if [[ ! -f "$BASE_DTB" ]]; then
+        warn "Base DTB not found: $BASE_DTB"
+        warn "USB Type-C will not work. Locate the DTB with:"
+        warn "  ls /usr/lib/linux-image-*/rockchip/*.dtb | grep cm5"
+        warn "Then re-run:  sudo bash scripts/setup_device.sh --phase=3"
+    elif ! command -v dtc &>/dev/null; then
+        warn "dtc not installed — skipping base DTB patches (run phase 1 first, then --phase=3)"
     else
-        warn "FIQ debugger DTS not found: $FIQ_DTS — skipping"
+        # Keep one backup of the unpatched original
+        if [[ ! -f "$BASE_DTB_BAK" ]]; then
+            cp "$BASE_DTB" "$BASE_DTB_BAK"
+            ok "Base DTB backup: $BASE_DTB_BAK"
+        fi
+
+        dtc -I dtb -O dts "$BASE_DTB" -o /tmp/base.dts 2>/dev/null
+        cp /tmp/base.dts /tmp/base.dts.orig
+
+        python3 - <<'PYEOF'
+import re, sys
+
+DTS = "/tmp/base.dts"
+with open(DTS) as f:
+    text = f.read()
+
+def blk_end(t, i):
+    d = 0
+    while i < len(t):
+        if t[i] == "{": d += 1
+        elif t[i] == "}":
+            d -= 1
+            if d == 0:
+                e = i + 1
+                if e < len(t) and t[e] == ";": e += 1
+                if e < len(t) and t[e] == "\n": e += 1
+                return e
+        i += 1
+    return len(t)
+
+def ln_start(t, i):
+    return t.rfind("\n", 0, i) + 1
+
+def find_blk(t, pat, lo=0, hi=None):
+    seg = t[lo:hi]
+    m = re.search(pat, seg)
+    if not m: return None
+    abs_hdr = lo + m.start()
+    brace = lo + m.end() - 1
+    while brace < len(t) and t[brace] != "{": brace += 1
+    return (ln_start(t, abs_hdr), blk_end(t, brace))
+
+def rm_blk(t, pat, lo=0, hi=None):
+    b = find_blk(t, pat, lo, hi)
+    if b is None: return t, False
+    return t[:b[0]] + t[b[1]:], True
+
+def rm_prop(t, prop, lo=0, hi=None):
+    seg = t[lo:hi]
+    m = re.search(r"[ \t]*" + re.escape(prop) + r"\s*=\s*[^;\n]*;\s*\n", seg)
+    if not m: return t, False
+    s, e = lo + m.start(), lo + m.end()
+    return t[:s] + t[e:], True
+
+fusb = find_blk(text, r"fusb302@22\s*\{")
+if fusb is None:
+    print("ERROR: fusb302@22 not found in DTS", file=sys.stderr)
+    sys.exit(1)
+
+n = 0
+
+# Patch 2: vbus-supply
+text, did = rm_prop(text, "vbus-supply", *fusb)
+if did: n += 1; print("  removed vbus-supply (GPIO4_A5/UART3 conflict)")
+else:        print("  skip vbus-supply (already absent)")
+fusb = find_blk(text, r"fusb302@22\s*\{")
+
+# Patch 3a: fusb302 top-level ports block (DWC3 role-switch)
+conn = find_blk(text, r"\bconnector\s*\{", *fusb)
+pre_conn = conn[0] if conn else fusb[1]
+text, did = rm_blk(text, r"\bports\s*\{", fusb[0], pre_conn)
+if did: n += 1; print("  removed fusb302 top-level ports (DWC3 role-switch)")
+else:        print("  skip fusb302 top-level ports (already absent)")
+fusb = find_blk(text, r"fusb302@22\s*\{")
+conn = find_blk(text, r"\bconnector\s*\{", *fusb)
+
+# Patch 3b: altmodes + ports inside connector
+if conn:
+    text, did = rm_blk(text, r"\baltmodes\s*\{", *conn)
+    if did: n += 1; print("  removed connector altmodes (DP alt-mode, no DisplayPort on carrier)")
+    else:        print("  skip connector altmodes (already absent)")
+    fusb = find_blk(text, r"fusb302@22\s*\{")
+    conn = find_blk(text, r"\bconnector\s*\{", *fusb)
+
+    text, did = rm_blk(text, r"\bports\s*\{", *conn)
+    if did: n += 1; print("  removed connector ports (USBDP PHY orientation + DP mux)")
+    else:        print("  skip connector ports (already absent)")
+
+with open(DTS, "w") as f: f.write(text)
+print(f"Done: {n} patch(es) applied.")
+PYEOF
+
+        if ! cmp -s /tmp/base.dts /tmp/base.dts.orig 2>/dev/null; then
+            if dtc -I dts -O dtb /tmp/base.dts -o /tmp/patched.dtb 2>/dev/null; then
+                cp /tmp/patched.dtb "$BASE_DTB"
+                ok "Base DTB patched: $BASE_DTB"
+                warn "USB Type-C fix takes effect after reboot (performed at end of setup)"
+            else
+                err "dtc recompile failed — base DTB unchanged"
+                warn "See Overlays/BASE_DTB_PATCH.md for manual patch steps"
+            fi
+        else
+            ok "Base DTB already patched (no changes needed)"
+        fi
+
+        rm -f /tmp/base.dts /tmp/base.dts.orig /tmp/patched.dtb
     fi
 
-    # Print final managed.list so it's visible in the log
-    if [[ -f "$BOOT_DTBO_DIR/managed.list" ]]; then
-        info "Active overlays in $BOOT_DTBO_DIR/managed.list:"
-        while IFS= read -r line; do
-            info "  $line"
-        done < "$BOOT_DTBO_DIR/managed.list"
-    fi
-fi
+fi  # end Phase 3
 
 # ---------------------------------------------------------------------------
 #  Phase 4 — Power optimization
