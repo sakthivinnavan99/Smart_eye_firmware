@@ -4,7 +4,7 @@
 / {
 	metadata {
 		title = "Smart Eye Custom Carrier Board";
-		compatible = "radxa,cm5-lite-io";
+		compatible = "radxa,cm5-io";
 		category = "misc";
 		exclusive = "GPIO0_C5\0GPIO3_B7\0GPIO3_C0\0GPIO4_A4\0GPIO4_A5\0GPIO4_A6\0GPIO1_D1\0GPIO1_D0\0GPIO0_D3\0GPIO0_D0\0GPIO0_C7\0GPIO4_A3\0GPIO4_A1\0GPIO4_A2\0GPIO4_B2\0GPIO0_A0";
 		description = "Enable peripherals for Smart Eye custom carrier board:\n  - PWM4-M0 (GPIO0_C5) vibration motor\n  - I2C3-M1 (GPIO3_B7 SCL / GPIO3_C0 SDA) BQ27220 fuel gauge + BQ25895 charger\n  - GPIO4_A4 fuel gauge GPOUT interrupt\n  - UART3-M2 (GPIO4_A5 TX / GPIO4_A6 RX) front ultrasonic (US-front)\n  - UART6-M2 (GPIO1_D1 TX / GPIO1_D0 RX) bottom ultrasonic (US-down)\n  - GPIO0_D3 CHG_INT0_L charger interrupt\n  - GPIO0_D0 LANG_BTN, GPIO0_C7 OCR_BTN\n  - Speaker: MAX98357A on I2S1-M0 (SD_MODE via BSS138 on GPIO4_A3)\n  - Headphone: ES8316 codec on I2S0 + I2C8-M2 (hp-det-gpio jack detect)\n  - GPIO0_A0 HP_INT pull-up (ES8316 GPIO3 open-drain; R29=0R, no PCB pull-up)\n  - I2S1 trcm-sync-tx-only: BCLK+LRCLK stop together (DC protection)";
@@ -325,66 +325,26 @@
 	};
 
 	/*
-	 * USB Type-C role switch: wire TCPM (fusb302) to DWC3's role switch.
+	 * USB Type-C role switch and OTG VBUS handling are intentionally NOT
+	 * done here.  They were previously fragment@8/@9/@10, but those added
+	 * three external dependencies that this base DTB does not export the
+	 * same way:
+	 *     - symbol  usbdrd_dwc3_0   (fragment@8 usb-role-switch phandle)
+	 *     - path    /i2c@fec80000/fusb302@22
+	 *     - path    /syscon@fd5d0000/usb2-phy@0/otg-port
+	 * U-Boot's `fdt apply` is all-or-nothing: a single unresolved symbol
+	 * or missing target path makes it drop the ENTIRE overlay, which took
+	 * i2c3 (fuel gauge/charger), the MAX98357A speaker card, the vibration
+	 * pinctrl and the UARTs down with it.
 	 *
-	 * tcpm.c calls usb_role_switch_get(port->dev) which resolves via
-	 * fwnode_find_reference(fwnode, "usb-role-switch", 0) — a direct
-	 * phandle lookup, no graph traversal.  Without this property
-	 * port->role_sw stays NULL and TCPM never calls
-	 * usb_role_switch_set_role() after CC negotiation, so DWC3 stays
-	 * "not attached" even though fusb302 correctly detects the partner.
-	 *
-	 * usbdrd_dwc3_0 is the stock Radxa/Rockchip label for usb@fc000000
-	 * (child of usbdrd3@fc400000).  The overlay fixup mechanism resolves
-	 * this symbol from the base DTB's __symbols__ section at boot.
+	 * The USB Type-C fix therefore lives entirely in the base DTB patches
+	 * (Overlays/BASE_DTB_PATCH.md, applied by setup_device.sh --phase=3):
+	 *   Patch 2 - remove fusb302 vbus-supply (GPIO4_A5/UART3 conflict)
+	 *   Patch 3 - remove TCPM connector deadlocks AND add
+	 *             usb-role-switch = <&usbdrd_dwc3_0> directly to fusb302@22
+	 * plus removing rk3588-dwc3-peripheral.dtbo from extlinux.conf so DWC3
+	 * runs in OTG mode and registers fc000000.usb-role-switch.  In the base
+	 * DTB those symbols/paths resolve natively, so there is no fragile
+	 * overlay fixup that can take the whole overlay down.
 	 */
-	fragment@8 {
-		target-path = "/i2c@fec80000/fusb302@22";
-		__overlay__ {
-			usb-role-switch = <&usbdrd_dwc3_0>;
-		};
-	};
-
-	/*
-	 * Always-on dummy VBUS regulator for USB2 PHY OTG BVALID detection.
-	 *
-	 * The CM5 module's USB_VBUS sense pin is not connected to the Type-C
-	 * VBUS output of TPS22916 on this carrier board. As a result, the
-	 * USB2 PHY (syscon@fd5d0000) hardware BVALID comparator (used when
-	 * rockchip,typec-vbus-det is set and no vbus-supply is present)
-	 * never fires, so DWC3 stays "not attached" even when a cable is
-	 * plugged in and CC negotiation succeeds.
-	 *
-	 * Workaround: add vcc_usb_vbus (always-on, no GPIO) as vbus-supply
-	 * for the USB2 PHY OTG port.  The PHY driver then uses
-	 * regulator_is_enabled() instead of the hardware comparator.
-	 * regulator_is_enabled(vcc_usb_vbus) is always true → PHY treats
-	 * BVALID as always HIGH → DWC3 enables the D+ pull-up when a gadget
-	 * is bound → USB enumerates as soon as a cable is connected.
-	 *
-	 * Side effect: DWC3 is always in gadget-ready state (D+ pull-up
-	 * asserted once NCM binds).  This is harmless — the host must supply
-	 * VBUS for enumeration to proceed, so no spurious enumeration occurs
-	 * when no cable is plugged in.
-	 */
-	fragment@9 {
-		target-path = "/";
-		__overlay__ {
-			vcc_usb_vbus: vcc-usb-vbus-regulator {
-				compatible = "regulator-fixed";
-				regulator-name = "vcc_usb_vbus";
-				regulator-min-microvolt = <5000000>;
-				regulator-max-microvolt = <5000000>;
-				regulator-always-on;
-				regulator-boot-on;
-			};
-		};
-	};
-
-	fragment@10 {
-		target-path = "/syscon@fd5d0000/usb2-phy@0/otg-port";
-		__overlay__ {
-			vbus-supply = <&vcc_usb_vbus>;
-		};
-	};
 };
