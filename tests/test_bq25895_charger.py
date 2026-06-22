@@ -77,7 +77,7 @@ def test_input_current_config():
         for ilim in test_values:
             charger.configure_input_current(ilim)
             read_back = charger.read_register(0x00) & 0x3F
-            calculated = (ilim - 100) // 100
+            calculated = (ilim - 100) // 50
             print(f"  {ilim:4d}mA → code {read_back:2d} (expected {calculated:2d})", end="")
             if read_back == calculated:
                 print(" ✓")
@@ -99,7 +99,7 @@ def test_charging_current_config():
         charger = BQ25895()
         for ichg in test_values:
             charger.configure_charging_current(ichg)
-            read_back = (charger.read_register(0x02) & 0xFC) >> 2
+            read_back = charger.read_register(0x04) & 0x7F   # REG04[6:0]
             calculated = ichg // 64
             print(f"  {ichg:4d}mA → code {read_back:2d} (expected {calculated:2d})", end="")
             if read_back == calculated:
@@ -122,7 +122,7 @@ def test_voltage_config():
         charger = BQ25895()
         for vreg in test_values:
             charger.configure_charging_voltage(vreg)
-            read_back = (charger.read_register(0x04) & 0xFC) >> 2
+            read_back = (charger.read_register(0x06) & 0xFC) >> 2   # REG06[7:2]
             calculated = (vreg - 3840) // 16
             print(f"  {vreg:4d}mV → code {read_back:2d} (expected {calculated:2d})", end="")
             if read_back == calculated:
@@ -139,14 +139,14 @@ def test_voltage_config():
 def test_termination_config():
     """Test 6: Termination current configuration."""
     print("\n--- Test 6: Termination Current Configuration ---")
-    test_values = [16, 64, 128, 256, 512]
+    test_values = [64, 128, 256, 512, 1024]   # range 64-1024mA step 64mA
 
     try:
         charger = BQ25895()
         for iterm in test_values:
             charger.configure_termination_current(iterm)
-            read_back = charger.read_register(0x03) & 0x0F
-            calculated = (iterm - 16) // 16
+            read_back = charger.read_register(0x05) & 0x0F   # REG05[3:0]
+            calculated = (iterm - 64) // 64
             print(f"  {iterm:4d}mA → code {read_back:2d} (expected {calculated:2d})", end="")
             if read_back == calculated:
                 print(" ✓")
@@ -171,14 +171,18 @@ def test_full_configuration():
         print("\n  Register Dump:")
         registers = {
             0x00: "Input Source Control",
-            0x01: "Power-On Configuration",
-            0x02: "Charge Current Control",
-            0x03: "Pre-charge/Termination",
-            0x04: "Charge Voltage Control",
-            0x05: "Charging Termination/Timer",
-            0x06: "Boost Voltage/Thermal",
-            0x08: "Status",
-            0x09: "Fault",
+            0x01: "VINDPM Offset",
+            0x02: "ADC Control",
+            0x03: "Charge Control (CHG_CONFIG/SYS_MIN)",
+            0x04: "Charge Current (ICHG)",
+            0x05: "Precharge/Termination Current",
+            0x06: "Charge Voltage (VREG)",
+            0x07: "Charge Timer/Watchdog",
+            0x08: "IR Comp/Thermal (TREG)",
+            0x09: "BATFET Control",
+            0x0B: "Status",
+            0x0C: "Fault",
+            0x14: "Device Version (PN)",
         }
 
         for reg, name in registers.items():
@@ -236,18 +240,18 @@ def test_thermal_regulation():
     """Test 9: Thermal regulation configuration."""
     print("\n--- Test 9: Thermal Regulation Configuration ---")
     thermal_thresholds = [
-        (0b00, "100°C (aggressive)"),
-        (0b01, "110°C"),
-        (0b10, "120°C"),
-        (0b11, "130°C (conservative)"),
+        (0b00, "60°C"),
+        (0b01, "80°C"),
+        (0b10, "100°C"),
+        (0b11, "120°C (default)"),
     ]
 
     try:
         charger = BQ25895()
         for code, desc in thermal_thresholds:
             charger.configure_thermal_regulation(code)
-            read_back = (charger.read_register(0x06) & 0xC0) >> 6
-            print(f"  {desc:25s} → code {read_back:2b}", end="")
+            read_back = charger.read_register(0x08) & 0x03   # REG08[1:0]
+            print(f"  {desc:25s} → code {read_back:02b}", end="")
             if read_back == code:
                 print(" ✓")
             else:
@@ -265,11 +269,12 @@ def test_safety_timer():
     try:
         charger = BQ25895()
 
-        # Test timer enable
+        # Test timer enable — EN_TIMER=REG07[3], CHG_TIMER=REG07[2:1]
         print("  Testing timer enable...")
         charger.set_charging_safety_timer(enable=True, fast_charge_timeout_hours=12)
-        timer_bit = (charger.read_register(0x05) & 0x20) >> 5
-        timeout_bits = (charger.read_register(0x05) & 0x0C) >> 2
+        reg07 = charger.read_register(0x07)
+        timer_bit   = (reg07 & 0x08) >> 3
+        timeout_bits = (reg07 & 0x06) >> 1
 
         if timer_bit:
             print(f"    Timer: Enabled ✓")
@@ -279,8 +284,8 @@ def test_safety_timer():
 
         # Test timer disable
         print("  Testing timer disable...")
-        charger.disable_watchdog()
-        timer_bit = (charger.read_register(0x05) & 0x20) >> 5
+        charger.set_charging_safety_timer(enable=False)
+        timer_bit = (charger.read_register(0x07) & 0x08) >> 3
 
         if not timer_bit:
             print(f"    Timer: Disabled ✓")
@@ -306,8 +311,8 @@ def test_longevity_configuration():
         # Verify key parameters
         print("\n  Verifying critical parameters:")
 
-        # Check charge voltage (should be ~4100mV)
-        vreg = charger.read_register(0x04)
+        # Check charge voltage (REG06[7:2], should be ~4100mV)
+        vreg = charger.read_register(0x06)
         vreg_code = (vreg & 0xFC) >> 2
         vreg_mv = 3840 + (vreg_code * 16)
         print(f"    Charge Voltage: {vreg_mv}mV (target 4100mV)", end="")
@@ -316,9 +321,9 @@ def test_longevity_configuration():
         else:
             print(f" ✗ (expected ~4100mV)")
 
-        # Check charge current (should be ~1024mA)
-        ichg = charger.read_register(0x02)
-        ichg_code = (ichg & 0xFC) >> 2
+        # Check charge current (REG04[6:0], should be ~1024mA)
+        ichg = charger.read_register(0x04)
+        ichg_code = ichg & 0x7F
         ichg_ma = ichg_code * 64
         print(f"    Charge Current: {ichg_ma}mA (target 1024mA)", end="")
         if 1000 <= ichg_ma <= 1100:
@@ -326,14 +331,14 @@ def test_longevity_configuration():
         else:
             print(f" ✗ (expected ~1024mA)")
 
-        # Check thermal threshold (should be 120°C = code 10)
-        treg = charger.read_register(0x06)
-        treg_code = (treg & 0xC0) >> 6
-        print(f"    Thermal Threshold: code {treg_code:02b} (target 10)", end="")
-        if treg_code == 0b10:
+        # Check thermal threshold (REG08[1:0], should be 120°C = code 11)
+        treg = charger.read_register(0x08)
+        treg_code = treg & 0x03
+        print(f"    Thermal Threshold: code {treg_code:02b} (target 11 = 120°C)", end="")
+        if treg_code == 0b11:
             print(" ✓")
         else:
-            print(" ✗ (expected 0b10 for 120°C)")
+            print(" ✗ (expected 0b11 for 120°C)")
 
         charger.close()
         return True

@@ -1,0 +1,16 @@
+[Unit]
+Description=Smart Eye Power Button (3-second hold to shutdown)
+# Must start after input devices are registered
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/battery-mgr/power-button-watch.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=smart-eye-power-btn
+
+[Install]
+WantedBy=multi-user.target

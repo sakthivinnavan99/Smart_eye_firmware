@@ -18,9 +18,30 @@ ExecStart=/bin/bash -c 'for g in /sys/class/devfreq/*gpu*; do f=$(head -1 "$g/av
 # HDMI / DP outputs: disable (no display connected)
 ExecStart=/bin/bash -c 'for d in /sys/class/drm/card*-HDMI* /sys/class/drm/card*-DP*; do [ -f "$d/enabled" ] && echo disabled > "$d/enabled"; done 2>/dev/null || true'
 
-# BQ25895 watchdog: disable so charge register settings survive
-# REG07 = 0x8F: WDT=OFF, EN_TERM=ON, CHG_TIMER=20h
-ExecStart=/bin/bash -c 'i2cset -y 3 0x6a 0x07 0x8f b 2>/dev/null || true'
+# BQ25895 full charger configuration — written on every boot because the IC
+# resets all registers to POR defaults when VBUS is removed or after ship mode.
+#
+# REG00=0x66  IINLIM=2000mA (code 38: 100+38×50)
+# REG02=0xFC  Continuous ADC, ICO enabled, AUTO_DPDM disabled
+# REG03=0x5A  CHG_CONFIG=1 (charging ON), SYS_MIN=3500mV
+# REG04=0x20  ICHG=2048mA  (code 32: 32×64)
+# REG05=0x33  IPRECHG=256mA (code 3), ITERM=256mA (code 3)
+# REG06=0x5E  VREG=4208mV  (code 23: 3840+23×16)
+# REG07=0x8F  WDT=OFF, EN_TERM=ON, CHG_TIMER=20h
+# REG08=0x03  TREG=120°C
+# REG09=0x4C  BATFET_DIS=0 (ON), BATFET_DLY=10s, BATFET_RST_EN=1
+# REG0A=0x93  BOOSTV=5126mV
+ExecStart=/bin/bash -c '\
+  i2cset -y 3 0x6a 0x00 0x66 b 2>/dev/null || true; \
+  i2cset -y 3 0x6a 0x02 0xfc b 2>/dev/null || true; \
+  i2cset -y 3 0x6a 0x03 0x5a b 2>/dev/null || true; \
+  i2cset -y 3 0x6a 0x04 0x20 b 2>/dev/null || true; \
+  i2cset -y 3 0x6a 0x05 0x33 b 2>/dev/null || true; \
+  i2cset -y 3 0x6a 0x06 0x5e b 2>/dev/null || true; \
+  i2cset -y 3 0x6a 0x07 0x8f b 2>/dev/null || true; \
+  i2cset -y 3 0x6a 0x08 0x03 b 2>/dev/null || true; \
+  i2cset -y 3 0x6a 0x09 0x4c b 2>/dev/null || true; \
+  i2cset -y 3 0x6a 0x0a 0x93 b 2>/dev/null || true'
 
 [Install]
 WantedBy=multi-user.target

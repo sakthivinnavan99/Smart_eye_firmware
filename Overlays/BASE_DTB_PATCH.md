@@ -126,14 +126,9 @@ sudo cp /usr/lib/linux-image-${KVER}/rockchip/rk3588s-radxa-cm5-io.dtb.bak.usb \
 ## What was changed
 
 In `/usr/lib/linux-image-<KVER>/rockchip/rk3588s-radxa-cm5-io.dtb`,
-inside the `fusb302@22` node and its `connector` sub-node:
+inside the `fusb302@22/connector` sub-node **only**:
 
 ```
-/* removed from fusb302@22 top-level: */
-ports {
-    port@0 { endpoint@0 { remote-endpoint = <0x169>; }; };  /* DWC3 role switch */
-};
-
 /* removed from fusb302@22/connector: */
 altmodes { altmode@0 { svid = <0xff01>; vdo = <0xffffffff>; }; };  /* DP altmode */
 
@@ -143,9 +138,17 @@ ports {
 };
 ```
 
+The fusb302 top-level `ports` block (role switch → DWC3) is **kept** — TCPM
+needs it for graph traversal.  The `usb-role-switch` phandle is separately
+added to fusb302's node by `smart-eye-carrier.dtbo` (fragment@8).
+
+Also required: remove `rk3588-dwc3-peripheral.dtbo` from extlinux.conf so DWC3
+runs in OTG mode and registers `fc000000.usb-role-switch`.  In peripheral-only
+mode DWC3 does NOT register a role switch, causing fusb302 to EPROBE_DEFER loop.
+
 ## Why
 
-Three circular deadlocks blocked the fusb302 TCPM from ever probing:
+Two circular deadlocks blocked fusb302 TCPM from ever probing:
 
 1. **DP alt-mode mux** (`connector/port@1` → `fed80000.phy endpoint@1`): The USBDP
    PHY defers registering its DP mux until it receives CC info from the fusb302
@@ -155,10 +158,6 @@ Three circular deadlocks blocked the fusb302 TCPM from ever probing:
 2. **USB orientation switch** (`connector/port@0` → `fed80000.phy endpoint@0`):
    Same circular dependency with the USBDP PHY's orientation switch. The PHY
    handles USB lane orientation internally once it probes.
-
-3. **USB role switch** (`fusb302 top-level port@0/endpoint@0` → `fc000000.usb`):
-   DWC3 role switch endpoint. Not needed because `rk3588-dwc3-peripheral.dtbo`
-   already forces `dr_mode = "peripheral"` statically.
 
 ## How to apply (manual — prefer setup_device.sh)
 

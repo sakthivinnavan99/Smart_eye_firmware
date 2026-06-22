@@ -666,6 +666,86 @@ class HeadphoneDetector:
 
 
 # ---------------------------------------------------------------------------
+#  Hardware abstraction: Charger detector (BQ25895 PG_STAT on I2C3)
+# ---------------------------------------------------------------------------
+
+class ChargerDetector:
+    """Detect charger connect/disconnect via BQ25895 PG_STAT (REG0B bit 2).
+
+    Polls I2C3/0x6A every 2 s with a 2-read debounce to avoid false triggers
+    from brief VBUS glitches.  Initial state is read synchronously at startup
+    so the first boot does NOT announce "Charger Connected" if the cable is
+    already plugged in.
+    """
+
+    POLL_INTERVAL  = 2.0
+    DEBOUNCE_READS = 2
+    _BUS  = 3
+    _ADDR = 0x6A
+    _REG  = 0x0B   # REG0B: bit 2 = PG_STAT
+
+    def __init__(self, on_change):
+        self._on_change = on_change
+        self._running   = False
+        self._thread    = None
+        try:
+            self._fd = os.open(f"/dev/i2c-{self._BUS}", os.O_RDWR)
+            fcntl.ioctl(self._fd, I2C_SLAVE, self._ADDR)
+        except OSError as e:
+            self._fd = None
+            log.warning("ChargerDetector: cannot open BQ25895: %s", e)
+        # Read initial state so boot does not fire a spurious "connected" event
+        self.connected = self._read_pg()
+        log.info("ChargerDetector: initial charger=%s",
+                 "connected" if self.connected else "disconnected" if self.connected is False else "unknown")
+
+    def _read_pg(self):
+        if self._fd is None:
+            return None
+        try:
+            os.write(self._fd, bytes([self._REG]))
+            data = os.read(self._fd, 1)
+            return bool((data[0] >> 2) & 1)
+        except OSError:
+            return None
+
+    def start(self):
+        if self._fd is None:
+            return
+        self._running = True
+        self._thread  = threading.Thread(target=self._poll, daemon=True)
+        self._thread.start()
+
+    def _poll(self):
+        candidate = None
+        agree     = 0
+        while self._running:
+            pg = self._read_pg()
+            if pg is not None:
+                if pg == candidate:
+                    agree += 1
+                else:
+                    candidate = pg
+                    agree     = 1
+                if agree >= self.DEBOUNCE_READS and pg != self.connected:
+                    self.connected = pg
+                    log.info("Charger %s", "connected" if pg else "disconnected")
+                    try:
+                        self._on_change(pg)
+                    except Exception as e:
+                        log.warning("ChargerDetector callback error: %s", e)
+            time.sleep(self.POLL_INTERVAL)
+
+    def stop(self):
+        self._running = False
+        if self._fd is not None:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------
 #  Hardware abstraction: Battery gauge (BQ27220 on I2C3)
 # ---------------------------------------------------------------------------
 I2C_SLAVE = 0x0703
@@ -766,6 +846,9 @@ class BatteryGauge:
             new = self._rw(self.REG_DESIGN_CAP)
             if abs(new - self.DESIGN_CAPACITY_MAH) <= 100:
                 log.info("BQ27220 reconfigured: DesignCapacity=%d mAh", new)
+                # Capacity was wrong → coulomb counter started from invalid baseline.
+                # SOFT_RESET re-initialises SOC from OCV so battery% is meaningful.
+                self.soft_reset()
             else:
                 log.warning("BQ27220 reconfigure may have failed: DesignCapacity=%d mAh", new)
         except OSError as e:
@@ -787,6 +870,24 @@ class BatteryGauge:
         self._w(0x60, [cksum, len(payload) + 2])  # MACDataSum + MACDataLen
         time.sleep(0.02)
 
+    def soft_reset(self):
+        """Issue SOFT_RESET (Control 0x0042) to re-initialise SOC from OCV.
+
+        The gauge reinitialises its coulomb counter from the current open-circuit
+        voltage. DesignCapacity and FCC are preserved. Call this when SOC appears
+        inconsistent with the measured battery voltage (e.g. 38% at 4.2 V).
+        Most accurate when no current is flowing; safe to call while charging.
+        """
+        if self.fd is None:
+            return
+        try:
+            with self._lock:
+                os.write(self.fd, bytes([0x00, 0x42, 0x00]))  # Control(SOFT_RESET)
+            log.info("BQ27220 SOFT_RESET issued — SOC will reinitialise from OCV")
+            time.sleep(2.0)
+        except OSError as e:
+            log.warning("BQ27220 soft_reset failed: %s", e)
+
     def _program_design_capacity(self):
         """Unseal -> full access -> CFGUPDATE -> write FCC+DesignCap -> exit."""
         # Unseal (default keys) then full access.
@@ -796,9 +897,10 @@ class BatteryGauge:
         self._ww(0x00, 0xFFFF); time.sleep(0.01)
 
         # Enter CFGUPDATE and wait for the flag.
-        self._ww(0x3E, 0x0090)
-        for _ in range(2000):
-            time.sleep(0.001)
+        # 0x0090 is a Control() subcommand — must go to register 0x00, not 0x3E.
+        self._ww(0x00, 0x0090)
+        for _ in range(100):
+            time.sleep(0.05)  # max 2 standard cmd reads/sec per datasheet §7.3.1.3
             if self._is_cfgupdate():
                 break
         else:
@@ -809,10 +911,11 @@ class BatteryGauge:
         self._write_dm_u16(self.DM_DESIGN_CAPACITY, self.DESIGN_CAPACITY_MAH)
 
         # Exit with reinit (commits RAM image) and wait for the flag to clear.
-        self._ww(0x3E, 0x0091)
+        # 0x0091 is also a Control() subcommand — register 0x00.
+        self._ww(0x00, 0x0091)
         time.sleep(2.0)
-        for _ in range(2000):
-            time.sleep(0.001)
+        for _ in range(100):
+            time.sleep(0.05)
             if not self._is_cfgupdate():
                 break
         self._ww(0x00, 0x0030)  # re-seal
@@ -1186,13 +1289,15 @@ class Translator:
 # ---------------------------------------------------------------------------
 AUDIO_FILES = {
     "en": {
-        "device_on":       "wav/English/device_turned_on.wav",
-        "pothole":         "wav/English/pothole.wav",
-        "stairs":          "wav/English/stairs.wav",
-        "no_text":         "wav/English/no_text_detected.wav",
-        "battery_10":      "wav/English/battery_10.wav",
-        "battery_shutdown": "wav/English/battery_shutdown.wav",
-        "lang_toggle":     "wav/English/English_mode.wav",
+        "device_on":            "wav/English/device_turned_on.wav",
+        "pothole":              "wav/English/pothole.wav",
+        "stairs":               "wav/English/stairs.wav",
+        "no_text":              "wav/English/no_text_detected.wav",
+        "battery_10":           "wav/English/battery_10.wav",
+        "battery_shutdown":     "wav/English/battery_shutdown.wav",
+        "lang_toggle":          "wav/English/English_mode.wav",
+        "charger_connected":    "wav/English/charger_connected.wav",
+        "charger_disconnected": "wav/English/charger_disconnected.wav",
         "fifty rupees":    "wav/English/fifty_rupees.wav",
         "five hundred rupees": "wav/English/five_hundred_rupees.wav",
         "five rupees":     "wav/English/five_rupees.wav",
@@ -1205,13 +1310,15 @@ AUDIO_FILES = {
         "two thousand rupees": "wav/English/two_thousand_rupees.wav",
     },
     "hi": {
-        "device_on":       "wav/Hindi/turned_on.wav",
-        "pothole":         "wav/Hindi/pothole_hindi.wav",
-        "stairs":          "wav/Hindi/stairs_detected.wav",
-        "no_text":         "wav/Hindi/no_text_found.wav",
-        "battery_10":      "wav/Hindi/ten_percent_battery_alert.wav",
-        "battery_shutdown": "wav/Hindi/five_percent_battery_alert.wav",
-        "lang_toggle":     "wav/Hindi/Hindi_mode.wav",
+        "device_on":            "wav/Hindi/turned_on.wav",
+        "pothole":              "wav/Hindi/pothole_hindi.wav",
+        "stairs":               "wav/Hindi/stairs_detected.wav",
+        "no_text":              "wav/Hindi/no_text_found.wav",
+        "battery_10":           "wav/Hindi/ten_percent_battery_alert.wav",
+        "battery_shutdown":     "wav/Hindi/five_percent_battery_alert.wav",
+        "lang_toggle":          "wav/Hindi/Hindi_mode.wav",
+        "charger_connected":    "wav/Hindi/charger_connected.wav",
+        "charger_disconnected": "wav/Hindi/charger_disconnected.wav",
         "fifty rupees":    "wav/Hindi/fifty_rupees.wav",
         "five hundred rupees": "wav/Hindi/five_hundred_rupees.wav",
         "five rupees":     "wav/Hindi/five_rupees.wav",
@@ -1251,7 +1358,7 @@ class SmartEyeApp:
         self._last_ocr = 0
         self._last_ultrasonic = 0
         self._last_gc = 0
-        self._battery_warned = False
+        self._last_soc_tier = None   # last 5%-tier milestone announced; None = not yet read
 
         log.info("Initializing Smart Eye system...")
 
@@ -1261,6 +1368,8 @@ class SmartEyeApp:
         self.audio = AudioPlayer()
         self.hp_detect = HeadphoneDetector(self.audio.set_output)
         self.hp_detect.start()
+        self.charger_detect = ChargerDetector(self._on_charger_change)
+        self.charger_detect.start()
         self.gauge = BatteryGauge()
         self.us_front = UltrasonicSensor(
             getattr(self.args, "us_front_device", "/dev/ttyS2"), label="US-front"
@@ -1332,8 +1441,10 @@ class SmartEyeApp:
 
     def _play(self, key):
         p = self._audio_path(key)
-        if p:
+        if p and os.path.isfile(p):
             self.audio.play(p)
+            return True
+        return False
 
     # --- Language slide switch (LANG_BTN GPIO0_D0, active-low) ---
     # gpio-keys sends EV_KEY with BTN_MISC (0x100):
@@ -1422,6 +1533,31 @@ class SmartEyeApp:
             log.warning("TTS error: %s", e)
 
     # --- Battery monitor ---
+    def _on_charger_change(self, connected):
+        if connected:
+            log.info("Charger connected — announcing")
+            if not self._play("charger_connected"):
+                self._tts_speak("Charger connected")
+        else:
+            log.info("Charger disconnected — announcing")
+            if not self._play("charger_disconnected"):
+                self._tts_speak("Charger disconnected")
+
+    def _announce_soc(self, tier):
+        """Announce a 5%-tier battery milestone.
+
+        Uses pre-recorded WAV for the two critical levels; TTS for everything else.
+        Tier is always a multiple of 5 (5, 10, 15, …, 95, 100).
+        """
+        if tier <= self.SOC_SHUTDOWN:        # 10% — critical, use urgent WAV
+            if not self._play("battery_shutdown"):
+                self._tts_speak(f"Battery {tier} percent. Please charge now.")
+        elif tier == self.SOC_WARN:          # 20% — warning WAV
+            if not self._play("battery_10"):
+                self._tts_speak(f"Battery {tier} percent. Low battery.")
+        else:
+            self._tts_speak(f"Battery {tier} percent")
+
     def _battery_loop(self):
         while self._running:
             try:
@@ -1435,14 +1571,21 @@ class SmartEyeApp:
                     b["avg_power_mw"], b["remaining_mah"], tte_str, b["temp_c"],
                 )
 
-                if soc <= self.SOC_SHUTDOWN and not self._battery_warned:
-                    self._play("battery_shutdown")
-                    self._battery_warned = True
-                elif soc <= self.SOC_WARN and not self._battery_warned:
-                    self._play("battery_10")
-                    self._battery_warned = True
-                elif soc > self.SOC_WARN:
-                    self._battery_warned = False
+                tier = (soc // 5) * 5   # floor to nearest 5% boundary (e.g. 87 → 85)
+
+                if self._last_soc_tier is None:
+                    # First reading — initialise silently so boot doesn't spam
+                    self._last_soc_tier = tier
+                elif tier < self._last_soc_tier:
+                    # SOC fell — announce every 5% tier we crossed, in descending order
+                    while self._last_soc_tier - 5 >= tier:
+                        self._last_soc_tier -= 5
+                        log.info("Battery tier crossed: %d%%", self._last_soc_tier)
+                        self._announce_soc(self._last_soc_tier)
+                elif tier > self._last_soc_tier:
+                    # SOC rose (charging) — update tracker so discharge re-announces
+                    self._last_soc_tier = tier
+
             except Exception as e:
                 log.warning("Battery read error: %s", e)
             time.sleep(self.BATTERY_INTERVAL)
@@ -1529,6 +1672,7 @@ class SmartEyeApp:
         self._running = False
         self.vibrator.cleanup()
         self.hp_detect.stop()
+        self.charger_detect.stop()
         self.buttons.stop()
         self.audio.stop()
         self.detector.close()

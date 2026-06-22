@@ -95,7 +95,7 @@ H = "=" * 62
 
 CHG_REGS = {
     0x00: 0x26,  # IINLIM=2000mA, EN_HIZ=0, EN_ILIM=0
-    0x02: 0xFD,  # Continuous ADC, ICO, Auto DPDM
+    0x02: 0xFC,  # Continuous ADC, ICO enabled, AUTO_DPDM disabled
     0x03: 0x5A,  # CHG=ON, OTG=OFF, SYS_MIN=3500mV, WD_RST
     0x04: 0x20,  # ICHG=2048mA
     0x05: 0x33,  # IPRECHG=256mA, ITERM=256mA
@@ -108,7 +108,7 @@ CHG_REGS = {
 
 CHG_REG_DESC = {
     0x00: "IINLIM=2000mA  EN_HIZ=0  EN_ILIM=0",
-    0x02: "Continuous ADC  ICO  Auto DPDM",
+    0x02: "Continuous ADC  ICO enabled  AUTO_DPDM=OFF",
     0x03: "CHG=ON  OTG=OFF  SYS_MIN=3500mV",
     0x04: "ICHG=2048mA (0.2C)",
     0x05: "IPRECHG=256mA  ITERM=256mA",
@@ -141,7 +141,7 @@ def configure_charger():
             got &= 0b10111111  # mask WD_RST (self-clearing)
             expect &= 0b10111111
         if reg == 0x02:
-            got |= 0x80   # mask CONV_START (self-clearing after ADC starts)
+            got |= 0x80   # CONV_START self-clears once ADC starts; ignore it in verify
         if got != expect:
             print(f"  FAIL  REG{reg:02X}: wrote 0x{CHG_REGS[reg]:02X}, read 0x{chg_rb(reg):02X}")
             ok = False
@@ -335,7 +335,7 @@ DAEMON_SOURCE = textwrap.dedent('''\
         def close(self): os.close(self.fd)
 
     def cfg_chg(b):
-        for r, v in [(0x00,0x26),(0x02,0xFD),(0x03,0x5A),(0x04,0x20),(0x05,0x33),
+        for r, v in [(0x00,0x26),(0x02,0xFC),(0x03,0x5A),(0x04,0x20),(0x05,0x33),
                       (0x06,0x5E),(0x07,0x8F),(0x08,0x03),(0x09,0x4C),(0x0A,0x93)]:
             b.wb(CHG, r, v)
         b.rb(CHG, 0x0C)

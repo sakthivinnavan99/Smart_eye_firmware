@@ -65,11 +65,22 @@ skip_phase() {
     return 1
 }
 
-# Parse arguments
+# Parse arguments — accept both --flag=VALUE and --flag VALUE forms
+_NEXT=""
 for arg in "$@"; do
+    if [[ -n "$_NEXT" ]]; then
+        case "$_NEXT" in
+            --phase) PHASE_ONLY="$arg" ;;
+            --from)  FROM_PHASE="$arg" ;;
+        esac
+        _NEXT=""
+        continue
+    fi
     case "$arg" in
         --phase=*)   PHASE_ONLY="${arg#--phase=}" ;;
+        --phase)     _NEXT="--phase" ;;
         --from=*)    FROM_PHASE="${arg#--from=}" ;;
+        --from)      _NEXT="--from" ;;
         --skip-dl)   SKIP_DL=1 ;;
         --offline)   OFFLINE=1; SKIP_DL=1 ;;
         --no-reboot) NO_REBOOT=1 ;;
@@ -383,14 +394,17 @@ if ! skip_phase 3; then
     #      Fix: remove vbus-supply from fusb302@22. The TPS22916 ON pin is
     #      hardwired to VCC5V0_SYS so no GPIO enable is needed.
     #
-    #  (b) Three TCPM port endpoint dependencies create circular probe
-    #      deadlocks with the USBDP PHY (fed80000.phy):
+    #  (b) Two TCPM endpoint dependencies in fusb302@22/connector create
+    #      circular probe deadlocks with the USBDP PHY (fed80000.phy):
     #        • DP alt-mode mux (connector port@1 → PHY endpoint@1)
     #        • USB orientation switch (connector port@0 → PHY endpoint@0)
-    #        • USB role switch (fusb302 top-level port@0 → DWC3 fc000000.usb)
-    #      None are needed: no DisplayPort hardware, PHY handles orientation
-    #      internally, DWC3 is already forced to peripheral mode.
-    #      Fix: remove all three port/endpoint blocks from fusb302@22.
+    #      The Smart Eye carrier has no DisplayPort hardware and the PHY
+    #      handles orientation internally.
+    #      Fix: remove connector altmodes and connector ports from fusb302@22.
+    #      NOTE: the fusb302 top-level ports block (role-switch → DWC3) is KEPT.
+    #      DWC3 must run in OTG mode (not peripheral-only) so it registers
+    #      fc000000.usb-role-switch; the smart-eye-carrier.dtbo (fragment@8)
+    #      adds usb-role-switch = <&usbdrd_dwc3_0> so TCPM can find it.
     #
     # See Overlays/BASE_DTB_PATCH.md for full details and manual steps.
 
@@ -475,16 +489,10 @@ if did: n += 1; print("  removed vbus-supply (GPIO4_A5/UART3 conflict)")
 else:        print("  skip vbus-supply (already absent)")
 fusb = find_blk(text, r"fusb302@22\s*\{")
 
-# Patch 3a: fusb302 top-level ports block (DWC3 role-switch)
+# Patch 3: altmodes + ports inside connector (USBDP PHY deadlocks)
+# fusb302 top-level ports block (role-switch → DWC3) is intentionally KEPT.
+# TCPM needs it; the carrier overlay adds usb-role-switch phandle separately.
 conn = find_blk(text, r"\bconnector\s*\{", *fusb)
-pre_conn = conn[0] if conn else fusb[1]
-text, did = rm_blk(text, r"\bports\s*\{", fusb[0], pre_conn)
-if did: n += 1; print("  removed fusb302 top-level ports (DWC3 role-switch)")
-else:        print("  skip fusb302 top-level ports (already absent)")
-fusb = find_blk(text, r"fusb302@22\s*\{")
-conn = find_blk(text, r"\bconnector\s*\{", *fusb)
-
-# Patch 3b: altmodes + ports inside connector
 if conn:
     text, did = rm_blk(text, r"\baltmodes\s*\{", *conn)
     if did: n += 1; print("  removed connector altmodes (DP alt-mode, no DisplayPort on carrier)")
@@ -868,8 +876,6 @@ ExecStart=/bin/sh -c '\
     ip addr add ${STATIC_IP}/${PREFIX} dev ${USB_IF} && \
     ip route replace default via ${GATEWAY} dev ${USB_IF}'
 
-ExecStartPost=/bin/sh -c 'echo "nameserver ${DNS}" > /etc/resolv.conf'
-
 ExecStop=/bin/sh -c '\
     ip addr flush dev ${USB_IF} 2>/dev/null || true; \
     ip route del default via ${GATEWAY} dev ${USB_IF} 2>/dev/null || true'
@@ -899,6 +905,7 @@ EOF
 
     # ── 9e: Disable sleep / suspend / hibernate ─────────────────────────────
     # Smart Eye must never auto-suspend — the user depends on instant response.
+    # HandlePowerKey=ignore so logind doesn't race our 3-second hold daemon.
     mkdir -p /etc/systemd/logind.conf.d
     cat > /etc/systemd/logind.conf.d/nosleep.conf <<'EOF'
 [Login]
@@ -928,7 +935,27 @@ EOF
     systemctl daemon-reload
     ok "Sleep / suspend / hibernate masked"
 
-    # ── 9f: Apply right now (no reboot needed for network) ──────────────────
+    # ── 9f: Power button hold-to-shutdown daemon (3-second hold) ────────────
+    # logind ignores the power key; this daemon reads the raw input event and
+    # initiates poweroff only after a 3-second hold to prevent accidental presses.
+    PWRBTN_SCRIPT="$PROJ/scripts/power-button-watch.py"
+    PWRBTN_DEST="/opt/battery-mgr/power-button-watch.py"
+    PWRBTN_SVC_SRC="$PROJ/services/smart-eye-power-btn.service"
+    PWRBTN_SVC="/etc/systemd/system/smart-eye-power-btn.service"
+
+    [[ -f "$PWRBTN_SCRIPT" ]] || die "Not found: $PWRBTN_SCRIPT"
+    [[ -f "$PWRBTN_SVC_SRC" ]] || die "Not found: $PWRBTN_SVC_SRC"
+
+    install -m 0755 "$PWRBTN_SCRIPT" "$PWRBTN_DEST"
+    if [[ ! -f "$PWRBTN_SVC" ]] || ! cmp -s "$PWRBTN_SVC_SRC" "$PWRBTN_SVC"; then
+        install -m 0644 "$PWRBTN_SVC_SRC" "$PWRBTN_SVC"
+        systemctl daemon-reload
+    fi
+    systemctl enable smart-eye-power-btn.service
+    systemctl restart smart-eye-power-btn.service 2>/dev/null || true
+    ok "Power button daemon installed (3-second hold to shutdown)"
+
+    # ── 9g: Apply right now (no reboot needed for network) ──────────────────
     systemctl start "$NET_SVC" 2>/dev/null && ok "$NET_SVC started immediately" || \
         info "$NET_SVC queued (usb0 not yet up — will apply on reboot)"
 
@@ -1372,21 +1399,43 @@ fi
 echo "\$(ts)  [FIRST-BOOT] BQ27220 found at i2c-3/0x55" >> "\$LOG"
 
 # ── Configure BQ25895 charger registers ───────────────────────────────────
-# REG07 = 0x8F  WDT=OFF, EN_TERM=ON, CHG_TIMER=20h
-#   Disabling watchdog is critical: without it the IC resets charge params
-#   every 40 s, which can cause SYS voltage spikes under load.
-echo "\$(ts)  [FIRST-BOOT] Configuring BQ25895..." >> "\$LOG"
-i2cset -y 3 0x6a 0x07 0x8f b 2>&1 | tee -a "\$LOG"
+# All registers are written here AND by smart-eye-power.service on every boot
+# (BQ25895 resets to POR defaults when VBUS is removed or after ship mode).
+echo "\$(ts)  [FIRST-BOOT] Configuring BQ25895 (10000mAh battery profile)..." >> "\$LOG"
 
-# REG09 = 0x4C  BATFET_DIS=0 (ON), BATFET_DLY=10s
-#   Ensures SYS rail is powered from battery; BATFET stays ON until an
-#   explicit ship-mode command (BATFET_DIS=1 written at poweroff).
+# REG00=0x66  IINLIM=2000mA
+i2cset -y 3 0x6a 0x00 0x66 b 2>&1 | tee -a "\$LOG"
+# REG02=0xFC  Continuous ADC, ICO enabled, AUTO_DPDM disabled
+#   AUTO_DPDM_EN=0: prevents BQ25895 from running D+/D- detection on every VBUS
+#   plug event and overwriting IINLIM to 500mA (SDP default). FUSB302 handles
+#   USB-C negotiation; BQ25895 should use the software-set 2000mA limit.
+i2cset -y 3 0x6a 0x02 0xfc b 2>&1 | tee -a "\$LOG"
+# REG03=0x5A  CHG_CONFIG=1 (charging ON), SYS_MIN=3500mV
+#   CHG_CONFIG defaults to 0 after ship-mode exit — must be set explicitly.
+i2cset -y 3 0x6a 0x03 0x5a b 2>&1 | tee -a "\$LOG"
+# REG04=0x20  ICHG=2048mA (≈0.2C for 10Ah)
+i2cset -y 3 0x6a 0x04 0x20 b 2>&1 | tee -a "\$LOG"
+# REG05=0x33  IPRECHG=256mA, ITERM=256mA
+i2cset -y 3 0x6a 0x05 0x33 b 2>&1 | tee -a "\$LOG"
+# REG06=0x5E  VREG=4208mV (standard Li-ion full charge)
+i2cset -y 3 0x6a 0x06 0x5e b 2>&1 | tee -a "\$LOG"
+# REG07=0x8F  WDT=OFF, EN_TERM=ON, CHG_TIMER=20h
+#   Disabling watchdog prevents silent register resets every 40s under load.
+i2cset -y 3 0x6a 0x07 0x8f b 2>&1 | tee -a "\$LOG"
+# REG08=0x03  TREG=120°C thermal regulation threshold
+i2cset -y 3 0x6a 0x08 0x03 b 2>&1 | tee -a "\$LOG"
+# REG09=0x4C  BATFET_DIS=0 (BATFET ON), BATFET_DLY=10s, BATFET_RST_EN=1
 i2cset -y 3 0x6a 0x09 0x4c b 2>&1 | tee -a "\$LOG"
+# REG0A=0x93  BOOSTV=5126mV
+i2cset -y 3 0x6a 0x0a 0x93 b 2>&1 | tee -a "\$LOG"
 
 # Verify key registers
+REG03=\$(i2cget -y 3 0x6a 0x03 b 2>/dev/null || echo "ERR")
+REG04=\$(i2cget -y 3 0x6a 0x04 b 2>/dev/null || echo "ERR")
+REG06=\$(i2cget -y 3 0x6a 0x06 b 2>/dev/null || echo "ERR")
 REG07=\$(i2cget -y 3 0x6a 0x07 b 2>/dev/null || echo "ERR")
 REG09=\$(i2cget -y 3 0x6a 0x09 b 2>/dev/null || echo "ERR")
-echo "\$(ts)  [FIRST-BOOT] BQ25895 REG07=\${REG07} (want 0x8f)  REG09=\${REG09} (want 0x4c)" >> "\$LOG"
+echo "\$(ts)  [FIRST-BOOT] BQ25895 REG03=\${REG03}(want 0x5a) REG04=\${REG04}(want 0x20) REG06=\${REG06}(want 0x5e) REG07=\${REG07}(want 0x8f) REG09=\${REG09}(want 0x4c)" >> "\$LOG"
 
 # ── Configure BQ27220 fuel gauge for 10000mAh pack ────────────────────────
 # Sets FullChargeCapacity and DesignCapacity so SOC/mAh readings scale
@@ -1518,9 +1567,10 @@ echo -e "What happens on first reboot:"
 echo -e "  1. All overlays load → I2C3, UARTs, PWM4, I2S1, IMX219 camera, FIQ debugger"
 echo -e "  2. smart-eye-usb-net.service → usb0 at 192.168.2.100 (SSH access)"
 echo -e "  3. smart-eye-first-boot.service runs first_boot_power_config.sh"
-echo -e "     → BQ25895: REG07=0x8F (WDT off), REG09=0x4C (BATFET ON)"
+echo -e "     → BQ25895: all 10 registers (ICHG=2048mA, VREG=4208mV, WDT off, ...)"
 echo -e "     → BQ27220: tests/config_fuel_gauge.py sets 10000mAh capacity"
 echo -e "  4. smart-eye-power.service sets CPU governors + disables HDMI"
+echo -e "     → BQ25895: all 10 registers reapplied (runs every boot)"
 echo -e "  5. vibration-motor-init.service hands GPIO0_C5 to PWM4 driver"
 echo -e "  6. smart-eye.service starts the main app (auto on every boot)"
 echo ""
