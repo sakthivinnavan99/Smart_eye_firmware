@@ -37,6 +37,8 @@ import wave
 import cv2
 import numpy as np
 
+import config
+
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ.setdefault("OMP_NUM_THREADS", "4")
 os.environ.setdefault("ORT_GLOBAL_THREAD_POOL_SIZE", "4")
@@ -1111,6 +1113,81 @@ class UltrasonicSensor:
 
 
 # ---------------------------------------------------------------------------
+#  Ultrasonic manager — strict sequential polling on a dedicated thread
+# ---------------------------------------------------------------------------
+class UltrasonicManager:
+    """Drive front and down AJ-SR04M sensors from a single background thread.
+
+    Strict sequential triggering with a mandatory inter-sensor silence gap
+    prevents acoustic crosstalk: the front burst fully completes and
+    US_BETWEEN_SENSORS_S of quiet time elapses before the down sensor fires.
+    The main detection loop reads the latest values through thread-safe
+    properties without ever blocking on sensor I/O.
+    """
+
+    def __init__(self, front: UltrasonicSensor, down: UltrasonicSensor,
+                 interval_s: float, between_s: float):
+        self._front    = front
+        self._down     = down
+        self._interval = interval_s   # min seconds between pair-cycle starts
+        self._between  = between_s    # mandatory silence gap between front→down
+        self._front_cm = None
+        self._down_cm  = None
+        self._lock     = threading.Lock()
+        self._running  = False
+        self._thread   = None
+
+    def start(self):
+        self._running = True
+        self._thread  = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        log.info(
+            "UltrasonicManager started (interval=%.2fs gap=%.2fs)",
+            self._interval, self._between,
+        )
+
+    def _loop(self):
+        while self._running:
+            t0 = time.monotonic()
+
+            # Step 1 — trigger front sensor; blocks until echo received or timeout
+            d_front = self._front.measure_cm()
+
+            # Step 2 — mandatory silence: residual acoustic energy from the front
+            # burst dissipates well before the down sensor fires
+            time.sleep(self._between)
+
+            # Step 3 — trigger down sensor
+            d_down = self._down.measure_cm()
+
+            # Publish atomically so the main loop never reads a half-updated pair
+            with self._lock:
+                self._front_cm = d_front
+                self._down_cm  = d_down
+
+            # Honour the minimum cycle interval; start next pair immediately if
+            # the measurement pair already took longer than the interval
+            gap = self._interval - (time.monotonic() - t0)
+            if gap > 0:
+                time.sleep(gap)
+
+    @property
+    def front_cm(self):
+        with self._lock:
+            return self._front_cm
+
+    @property
+    def down_cm(self):
+        with self._lock:
+            return self._down_cm
+
+    def stop(self):
+        self._running = False
+        self._front.close()
+        self._down.close()
+
+
+# ---------------------------------------------------------------------------
 #  Camera + RKNN inference
 # ---------------------------------------------------------------------------
 class CameraDetector:
@@ -1337,28 +1414,28 @@ AUDIO_FILES = {
 #  Application
 # ---------------------------------------------------------------------------
 class SmartEyeApp:
-    US_FRONT_THRESHOLD_CM = 60
-    US_DOWN_THRESHOLD_CM = 130
-    ANNOUNCE_COOLDOWN = 2.0
-    OCR_COOLDOWN = 1.5
-    BATTERY_INTERVAL = 30.0
-    DETECTION_FPS = 5             # target detection frame rate (saves ~70% CPU vs unlimited)
-    ULTRASONIC_INTERVAL = 0.5     # check ultrasonic every 500ms, not every frame
-    US_INTER_SENSOR_DELAY = 0.2   # delay between front and down to avoid acoustic crosstalk (seconds)
-    GC_INTERVAL = 10.0            # gc.collect every 10s instead of every frame
+    US_FRONT_THRESHOLD_CM = config.US_FRONT_THRESHOLD_CM
+    US_DOWN_THRESHOLD_CM  = config.US_DOWN_THRESHOLD_CM
+    ANNOUNCE_COOLDOWN     = config.ANNOUNCE_COOLDOWN_S
+    OCR_COOLDOWN          = config.OCR_COOLDOWN_S
+    BATTERY_INTERVAL      = config.BATTERY_POLL_INTERVAL_S
+    DETECTION_FPS         = config.DETECTION_FPS
+    GC_INTERVAL           = config.GC_INTERVAL_S
+    _US_VIBRATE_COOLDOWN  = config.US_VIBRATE_COOLDOWN_S
 
-    SOC_WARN = 20
-    SOC_SHUTDOWN = 10
+    SOC_WARN     = config.SOC_WARN_PCT
+    SOC_SHUTDOWN = config.SOC_SHUTDOWN_PCT
 
     def __init__(self, args):
         self.args = args
         self.lang = "en"
         self._running = True
-        self._last_announce = 0
-        self._last_ocr = 0
-        self._last_ultrasonic = 0
-        self._last_gc = 0
-        self._last_soc_tier = None   # last 5%-tier milestone announced; None = not yet read
+        self._last_announce   = 0
+        self._last_ocr        = 0
+        self._last_gc         = 0
+        self._last_soc_tier   = None   # last 5%-tier milestone announced; None = not yet read
+        self._us_front_buzz_t = 0.0    # monotonic time of last front-sensor vibration
+        self._us_down_buzz_t  = 0.0    # monotonic time of last down-sensor vibration
 
         log.info("Initializing Smart Eye system...")
 
@@ -1371,12 +1448,19 @@ class SmartEyeApp:
         self.charger_detect = ChargerDetector(self._on_charger_change)
         self.charger_detect.start()
         self.gauge = BatteryGauge()
-        self.us_front = UltrasonicSensor(
-            getattr(self.args, "us_front_device", "/dev/ttyS2"), label="US-front"
+        self.us_manager = UltrasonicManager(
+            front=UltrasonicSensor(
+                getattr(self.args, "us_front_device", config.US_FRONT_DEVICE),
+                label="US-front",
+            ),
+            down=UltrasonicSensor(
+                getattr(self.args, "us_down_device", config.US_DOWN_DEVICE),
+                label="US-down",
+            ),
+            interval_s=config.US_POLL_INTERVAL_S,
+            between_s=config.US_BETWEEN_SENSORS_S,
         )
-        self.us_down = UltrasonicSensor(
-            getattr(self.args, "us_down_device", "/dev/ttyS6"), label="US-down"
-        )
+        self.us_manager.start()
         self.ocr = OCREngine()
         self.translator = Translator()
 
@@ -1639,18 +1723,19 @@ class SmartEyeApp:
                 for det in detections:
                     self._announce(det["label"])
 
-                now = time.monotonic()
-                if now - self._last_ultrasonic >= self.ULTRASONIC_INTERVAL:
-                    self._last_ultrasonic = now
-                    d_front = self.us_front.measure_cm()
-                    time.sleep(self.US_INTER_SENSOR_DELAY)
-                    d_down  = self.us_down.measure_cm()
+                now     = time.monotonic()
+                d_front = self.us_manager.front_cm
+                d_down  = self.us_manager.down_cm
 
-                    if d_front is not None and d_front < self.US_FRONT_THRESHOLD_CM:
+                if d_front is not None and d_front < self.US_FRONT_THRESHOLD_CM:
+                    if now - self._us_front_buzz_t >= self._US_VIBRATE_COOLDOWN:
+                        self._us_front_buzz_t = now
                         log.info("US-front obstacle: %.0f cm", d_front)
                         self.vibrator.buzz(300, 80)
 
-                    if d_down is not None and d_down < self.US_DOWN_THRESHOLD_CM:
+                if d_down is not None and d_down < self.US_DOWN_THRESHOLD_CM:
+                    if now - self._us_down_buzz_t >= self._US_VIBRATE_COOLDOWN:
+                        self._us_down_buzz_t = now
                         log.info("US-down obstacle: %.0f cm", d_down)
                         self.vibrator.pulse(2, 150, 100, 60)
 
@@ -1676,8 +1761,7 @@ class SmartEyeApp:
         self.buttons.stop()
         self.audio.stop()
         self.detector.close()
-        self.us_front.close()
-        self.us_down.close()
+        self.us_manager.stop()
         self.gauge.close()
         log.info("Cleanup complete.")
 
@@ -1687,22 +1771,22 @@ class SmartEyeApp:
 # ---------------------------------------------------------------------------
 def parse_args():
     p = argparse.ArgumentParser(description="Smart Eye assistive vision system")
-    p.add_argument("--model", default=os.path.join(PROJECT_ROOT, "models/pathpal/model_v2_large.rknn"),
+    p.add_argument("--model", default=os.path.join(PROJECT_ROOT, config.MODEL_PATH),
                    help="Path to RKNN model file")
-    p.add_argument("--platform", default="rk3582",
-                   help="Target SoC platform (rk3582/rk3588s map to rk3588 for RKNNLite, default: rk3582)")
-    p.add_argument("--camera", default="/dev/video11",
+    p.add_argument("--platform", default=config.PLATFORM,
+                   help="Target SoC platform (rk3582/rk3588s map to rk3588 for RKNNLite)")
+    p.add_argument("--camera", default=config.CAMERA_DEVICE,
                    help="V4L2 camera device")
-    p.add_argument("--threshold", type=float, default=0.65,
+    p.add_argument("--threshold", type=float, default=config.DETECTION_THRESHOLD,
                    help="Detection confidence threshold")
-    p.add_argument("--labels", default=os.path.join(PROJECT_ROOT, "models/pathpal/labels.txt"),
+    p.add_argument("--labels", default=os.path.join(PROJECT_ROOT, config.LABELS_PATH),
                    help="Path to custom class labels file (one per line)")
-    p.add_argument("--fps", type=int, default=5,
-                   help="Target detection FPS (lower = less power, default 5)")
-    p.add_argument("--us-front-device", default="/dev/ttyS3",
-                   help="Serial device for front ultrasonic (default /dev/ttyS3 via UART3-M2)")
-    p.add_argument("--us-down-device", default="/dev/ttyS6",
-                   help="Serial device for bottom ultrasonic (default /dev/ttyS6 via UART6-M2; use 'none' to disable)")
+    p.add_argument("--fps", type=int, default=config.DETECTION_FPS,
+                   help="Target detection FPS (lower = less power)")
+    p.add_argument("--us-front-device", default=config.US_FRONT_DEVICE,
+                   help="Serial device for front ultrasonic (UART3-M2)")
+    p.add_argument("--us-down-device", default=config.US_DOWN_DEVICE,
+                   help="Serial device for bottom ultrasonic (UART6-M2; 'none' to disable)")
     return p.parse_args()
 
 
